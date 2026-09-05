@@ -1,0 +1,25 @@
+services:
+  app:
+    build: .
+    environment:
+      OV_DATA: /data
+      OV_ORIGIN: ${OV_ORIGIN:-https://localhost}
+    ports:
+      - "127.0.0.1:8000:8000"
+    volumes:
+      - evidence:/data
+    read_only: true
+    tmpfs:
+      - /tmp:mode=1777,size=128m
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import os,urllib.request,urllib.parse; r=urllib.request.Request('http://127.0.0.1:8000/healthz',headers={'Host':urllib.parse.urlsplit(os.environ['OV_ORIGIN']).netloc}); urllib.request.urlopen(r,timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+volumes:
+  evidence:
