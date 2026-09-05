@@ -36,7 +36,7 @@ def document(state, kind, identifier=None, events=None, catalog=None):
     for name in ["Normal", "BodyText", "Title", "Heading1", "Heading2"]:
         styles[name].fontName = font_name
     styles["BodyText"].fontSize = 9
-    styles["BodyText"].leading = 13
+    styles["BodyText"].leading = 12
     styles.add(ParagraphStyle(name="SmallOV", fontName=font_name, fontSize=7, leading=10,
                               textColor=colors.HexColor("#46576B")))
     output, story = io.BytesIO(), []
