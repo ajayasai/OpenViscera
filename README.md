@@ -2,7 +2,28 @@
 
 **Every specimen. Every next step.** A self-hosted forensic-medicine department workbench for specimen dispatch, custody reconciliation, external laboratory reports, and pending final or supplementary opinions.
 
-**Status: v0.1.0 — evaluated pilot, not a clinically validated production system.** Human experts enter preservative details, review results, and write opinions. OpenViscera does not interpret laboratory findings, recommend preservatives, infer causes of death, or generate medical conclusions.
+**Status: v0.2.0 — tested workflow/security upgrade, not a clinically validated production system.** Human experts enter preservative details, review results, and write opinions. OpenViscera does not interpret laboratory findings, recommend preservatives, infer causes of death, or generate medical conclusions.
+
+## New in v0.2
+
+This release closes concrete limitations in the original pilot rather than making an untested claim to beat every commercial system.
+
+| Improvement | Implemented behavior |
+| --- | --- |
+| Restricted case access | Explicit named members; no implicit administrator bypass for clinical contents. Enforced on direct reads, lists/counts, queues, downloads, exports and scanner lookup. |
+| Signed access audit | Department-specific HTTP access chains record handled reads, exports and denied requests without case narratives, passwords or query strings. Sensitive responses are withheld if audit append fails. |
+| Controlled corrections | Before/after specimen or requesting-authority corrections need an independent reviewer. Original values and both decisions remain in signed history. |
+| Report/opinion withdrawal | Report disputes and independent withdrawal decisions; no silent revival of an older revision. Issued opinions can be withdrawn without erasing their original text or approvals. |
+| Complete return path | Documentary external-laboratory returns record the external sender and authenticated local receiver; seal discrepancies remain explicit. |
+| Additional examinations | A new request for a specimen already at the lab can receive its own documented/authenticated acceptance without inventing a physical handover. |
+| Atomic dispatch batches | Preview and commit up to 100 handovers in one case/transaction. Any invalid item rejects the whole batch; every container retains its own signed event and outstanding acknowledgement. |
+| Scanner lookup | Find a container using its identifier or an opaque OpenViscera QR payload. The same case and laboratory permissions apply. |
+| Password lifecycle | Current-password-verified change, persistent failed-change throttling and revocation of every existing session. |
+| Explicit upgrade | Additive v1-to-v2 database migration, a frozen v1 reducer and schema-aware replay preserve existing signatures and issued records. |
+
+**Measured validation:** 169 tests passed, 97% Python statement coverage (1,636 of 1,686 statements), and an expanded real Chromium UI test using an in-process API transport. An internal 25-container benchmark measured a median **264.4 ms for individual handovers versus 37.1 ms for an atomic batch (7.13×)** over five repetitions. Both modes produced 25 signed events and passed full replay. This measures store operations, not transport, operator time, production capacity or performance against a commercial product. Raw results and methodology accompany the release validation artifacts; the benchmark is reproducible with `python tools/benchmark_dispatch.py`.
+
+**Existing installations:** stop the old service, back up, install v0.2, then run `openviscera migrate --data ./var`. The server refuses unmigrated stores. Read [upgrade and control semantics](docs/V02-UPGRADE.md), [validation](docs/VALIDATION.md), and the [primary-source competitive review](docs/V02-COMPETITIVE-REVIEW.md).
 
 ## What works
 
@@ -59,7 +80,7 @@ OV_BROWSER_TEST=1 pytest tests/test_browser.py
 
 For PowerShell, set `$env:OV_BROWSER_TEST="1"` before invoking pytest. The browser suite exercises actual forms and the actual API, including different accounts, issuing an opinion, and revision-triggered reopening.
 
-Initial evaluation: **105 tests passed, 96% Python statement coverage (rounded)**, including Chromium desktop/mobile workflow validation through an in-process API harness. The evaluation environment blocked browser HTTP navigation, so normal-network browser execution was not claimed locally. See [validation details](docs/VALIDATION.md) for commands, scope, and what was not tested.
+Current local evaluation: **169 tests passed, 97% Python statement coverage**. Chromium exercised case restriction, independent correction/withdrawal decisions, external return, previewed batch dispatch, scanner lookup, password change and audit viewing as well as the original lifecycle. Browser transport used the documented in-process harness because this environment blocks local HTTP navigation; server controls have separate HTTP API tests. The GitHub Actions browser job is configured to use the normal network path. See [validation details](docs/VALIDATION.md) for precise scope.
 
 ## Verify exported evidence independently
 
@@ -91,7 +112,7 @@ OpenViscera's implemented focus is the department-side gap around external labor
 
 [Workflow and permissions](docs/WORKFLOW.md) · [Architecture](docs/ARCHITECTURE.md) · [Deployment and recovery](docs/OPERATIONS.md) · [Validation](docs/VALIDATION.md) · [Security policy](SECURITY.md) · [Contributing](CONTRIBUTING.md)
 
-Known limits include SQLite/single-process deployment, no HA or measured large-department capacity, no SSO/MFA, no restricted-case ACLs within a department, no antivirus/content-disarm pipeline, no laboratory/instrument connectors, no automatic email delivery, no retention/disposal workflow or password-reset interface. The database is not encrypted at rest by the application. External-lab specimen return and additional examinations requested after an already-completed receipt need further workflow support. Do not use a fabricated transfer to work around those limits.
+Known limits include SQLite/single-process deployment, no HA or measured large-department capacity, no SSO/MFA or forgotten-password recovery, no antivirus/content-disarm pipeline, no laboratory/instrument connectors, no automatic email delivery, and no retention/disposal workflow. The database is not encrypted at rest by the application. Restricted-case membership needs careful administration because no emergency bypass or general examiner-reassignment workflow is provided. Already exported copies are not automatically recalled when an opinion is withdrawn.
 
 The default PDF font covers the application's basic Latin output; configure a deployment-supplied font through `OV_PDF_FONT` for other scripts and validate rendering. Unsupported default-font characters fail explicitly rather than silently producing corrupted text. Fonts are not bundled. Labels currently print on A4 rather than thermal-printer templates.
 
