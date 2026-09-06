@@ -19,6 +19,8 @@ def main(argv=None):
     init.add_argument("--data", default="./var")
     init.add_argument("--admin", default="admin")
     init.add_argument("--department", default="department")
+    migrate_parser = sub.add_parser("migrate", help="Explicitly upgrade an existing v1 store; stop the server and back up first")
+    migrate_parser.add_argument("--data", default="./var")
     demo = sub.add_parser("demo", help="Create synthetic cases with randomly generated demo credentials")
     demo.add_argument("--data", default="./demo-data")
     serve = sub.add_parser("serve", help="Serve the browser application")
@@ -51,6 +53,9 @@ def main(argv=None):
                                             "role": "admin", "password": password})
             print("Initialized. Create examiner, reviewer and coordinator accounts from the Administration screen.")
             print("Store public-key.txt separately; protect signing.key and the entire data directory.")
+        elif args.command == "migrate":
+            from .migrations import migrate
+            print(json.dumps(migrate(args.data), indent=2))
         elif args.command == "demo":
             from .demo import populate
             credentials = populate(Store.initialize(args.data))
@@ -77,7 +82,7 @@ def main(argv=None):
                 json.dump(result, stream, indent=2)
             print("Verified", len(checkpoint["heads"]), "cases. Retain checkpoint outside this deployment.")
         elif args.command == "backup":
-            store = Store(args.data)
+            store = Store(args.data, allow_legacy=True)
             password = getpass.getpass("Backup passphrase (14+ characters): ")
             require(password == getpass.getpass("Confirm passphrase: "), "Passphrases differ", 422)
             content = encrypted_backup(store, password)
