@@ -13,7 +13,20 @@ from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.platypus import (SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, Image,
                                KeepTogether)
 
-from .domain import evidence_fingerprint, item, now_iso, require
+from .domain import apply, evidence_fingerprint, item, now_iso, require, opinion_withdrawal, report_withdrawal
+
+
+def dispatch_snapshot(events, identifier):
+    """Reconstruct the dispatch-time metadata instead of silently rewriting a covering letter."""
+    require(events is not None, "Dispatch PDF requires verified historical events")
+    state = None
+    for event in events:
+        body = event["body"]
+        state = apply(state, body["action"], body["data"], body["actor"], body["recorded_at"],
+                      body["event_id"], body["case_id"], schema=body["schema"])
+        if body["event_id"] == identifier and body["action"] in {"handover", "record_return"}:
+            return state
+    require(False, "Transfer not found in verified history", 404)
 
 
 def document(state, kind, identifier=None, events=None, catalog=None):
@@ -76,9 +89,12 @@ def document(state, kind, identifier=None, events=None, catalog=None):
         story.extend([text("OPENVISCERA", "Heading2"), text(titles[kind], "Title"),
                       text("Case " + state["case_ref"] + " | Version " + str(state["version"])), Spacer(1, 5 * mm)])
         if kind == "dispatch":
-            transfer = item(state, "transfers", identifier)
-            sp = item(state, "specimens", transfer["specimen_id"])
-            pairs([("Authority", state["authority"]), ("Container", sp["container_id"]),
+            snapshot = dispatch_snapshot(events, identifier)
+            transfer = item(snapshot, "transfers", identifier)
+            sp = item(snapshot, "specimens", transfer["specimen_id"])
+            story.append(text("Dispatch-time snapshot, recorded case version " + str(snapshot["version"]) +
+                              ". Later corrections are preserved in the chronology, not silently applied to this letter.", "SmallOV"))
+            pairs([("Authority", snapshot["authority"]), ("Container", sp["container_id"]),
                    ("Specimen", sp["description"]), ("Quantity", sp["quantity"] + " " + sp["unit"]),
                    ("Preservative (entered)", sp["preservative"]), ("Seal at dispatch", transfer["seal_ref"]),
                    ("Sender", account(transfer["sender_id"])),
@@ -86,7 +102,7 @@ def document(state, kind, identifier=None, events=None, catalog=None):
                    ("Destination", transfer["destination"]), ("Handover time", transfer["occurred_at"]),
                    ("Reference", transfer["id"])])
             story.append(text("Requested examinations", "Heading2"))
-            for request in state["requests"]:
+            for request in snapshot["requests"]:
                 if request["specimen_id"] == sp["id"]:
                     story.append(text(request["examination"] + " | Laboratory " + laboratory(request["lab_id"])))
             story.append(text("Please acknowledge receipt, seal condition and any discrepancy. This covering letter is not proof of receipt."))
@@ -102,7 +118,10 @@ def document(state, kind, identifier=None, events=None, catalog=None):
             story.append(text("An unacknowledged record is a pending handover, not a completed receipt. External receipts are evidence-backed staff transcriptions, not authenticated laboratory signatures."))
         elif kind == "opinion":
             opinion = item(state, "opinions", identifier)
-            status = "ISSUED" if opinion["issued_at"] else "DRAFT / NOT ISSUED"
+            withdrawal = opinion_withdrawal(state, opinion["id"])
+            status = "WITHDRAWN / DO NOT RELY ON THIS OPINION" if withdrawal else "ISSUED" if opinion["issued_at"] else "DRAFT / NOT ISSUED"
+            if withdrawal:
+                story.append(text("Withdrawal reason: " + withdrawal["reason"], "Heading2"))
             story.extend([text(status, "Heading1"), text(opinion["kind"].upper(), "Heading2"), text(opinion["body"]), Spacer(1, 6 * mm)])
             if opinion["issued_at"] and opinion["evidence_fingerprint"] != evidence_fingerprint(state):
                 story.append(text("HISTORICAL ISSUED RECORD: later evidence has been recorded. Check the current pending-opinion status.", "Heading2"))
@@ -112,7 +131,9 @@ def document(state, kind, identifier=None, events=None, catalog=None):
             story.append(text("Incorporated report revisions", "Heading2"))
             for rid in opinion["report_ids"]:
                 report = item(state, "reports", rid)
-                story.append(text(report["laboratory_reference"] + " | revision " + str(report["revision"]) + " | " + rid))
+                withdrawal = report_withdrawal(state, rid)
+                warning = " | REPORT WITHDRAWN OR DISPUTED" if withdrawal else ""
+                story.append(text(report["laboratory_reference"] + " | revision " + str(report["revision"]) + " | " + rid + warning))
         else:
             require(events is not None, "Chronology requires verified events")
             for event in events:
