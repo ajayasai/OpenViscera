@@ -16,8 +16,9 @@ from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from pydantic import ValidationError
 
-from .domain import (RuleError, apply, canonical, digest, item, normalized, now_iso, require)
+from .domain import (RuleError, apply, canonical, digest, item, normalized, now_iso, require, may_access)
 from .models import CaseCreate, MODELS, ROLES, UserCreate, LabCreate
+from .governance import GovernanceMixin, AUDIT_SCHEMA
 
 SCHEMA = """
 PRAGMA journal_mode=WAL;
@@ -78,11 +79,11 @@ def validate(model, data):
 
 
 def verify_events(events, public_key, state=None, replay=False):
-    previous, projection = "0" * 64, None
+    previous, projection, last_schema = "0" * 64, None, 1
     require(bool(events), "Empty evidence ledger")
     for seq, event in enumerate(events, 1):
         body = event["body"]
-        require(body["schema"] == 1 and body["seq"] == seq and body["previous_hash"] == previous,
+        require(body["schema"] in {1, 2} and body["schema"] >= last_schema and body["seq"] == seq and body["previous_hash"] == previous,
                 "Evidence ledger sequence/chain mismatch")
         require(event["hash"] == digest(body), "Evidence event hash mismatch")
         try:
@@ -94,9 +95,10 @@ def verify_events(events, public_key, state=None, replay=False):
             case_id, org_id = body["case_id"], body["actor"]["org_id"]
         require(body["case_id"] == case_id and body["actor"]["org_id"] == org_id,
                 "Cross-case or cross-organization event")
+        last_schema = body["schema"]
         if replay:
             projection = apply(projection, body["action"], body["data"], body["actor"],
-                               body["recorded_at"], body["event_id"], body["case_id"])
+                               body["recorded_at"], body["event_id"], body["case_id"], schema=body["schema"])
             require(digest(projection) == body["after_digest"], "Replayed projection does not match event")
         previous = event["hash"]
     if state is not None:
@@ -105,8 +107,8 @@ def verify_events(events, public_key, state=None, replay=False):
     return previous
 
 
-class Store:
-    def __init__(self, data_dir):
+class Store(GovernanceMixin):
+    def __init__(self, data_dir, allow_legacy=False):
         self.path = Path(data_dir)
         self.db = self.path / "openviscera.sqlite3"
         require(self.db.is_file() and (self.path / "signing.key").is_file(),
@@ -115,7 +117,8 @@ class Store:
         self.public_key = self.key.public_key()
         with self.transaction(False) as c:
             meta = dict(c.execute("SELECT name,value FROM meta"))
-            require(meta.get("schema") == "1", "Unsupported database schema", 503)
+            require(meta.get("schema") == "2" or (allow_legacy and meta.get("schema") == "1"),
+                    "Database upgrade required: stop the service, back up, then run openviscera migrate", 503)
             require(meta.get("public_key") == self.public_b64, "Signing key does not match this database", 503)
         self.dummy_password = password_hash(secrets.token_urlsafe(24))
 
@@ -140,7 +143,9 @@ class Store:
         (path / "public-key.txt").write_text(public + "\n")
         with closing(sqlite3.connect(path / "openviscera.sqlite3")) as c, c:
             c.executescript(SCHEMA)
-            c.executemany("INSERT INTO meta VALUES (?,?)", [("schema", "1"), ("public_key", public)])
+            for statement in AUDIT_SCHEMA:
+                c.execute(statement)
+            c.executemany("INSERT INTO meta VALUES (?,?)", [("schema", "2"), ("public_key", public)])
         os.chmod(path / "openviscera.sqlite3", 0o600)
         return cls(path)
 
@@ -291,9 +296,8 @@ class Store:
         require(row is not None, "Case not found", 404)
         s = json.loads(row["state"])
         require(s["org_id"] == actor["org_id"] and s["id"] == case_id, "Case identity projection mismatch")
-        if actor["role"] == "lab":
-            require(any(r["lab_id"] == actor["lab_id"] for r in s["requests"]), "Case not found", 404)
         verify_events(self._events(c, case_id), self.public_key, s)
+        require(may_access(actor, s), "Case not found", 404)
         return s
 
     def visible(self, actor, state):
@@ -311,6 +315,10 @@ class Store:
         report_files = {r["attachment_id"] for r in s["reports"]}
         s["attachments"] = [a for a in s["attachments"] if a["id"] in report_files or
                             (a["uploaded_by"] == actor["id"] and a["specimen_id"] in specimens)]
+        visible_reports = {r["id"] for r in s["reports"]}
+        if "controls" in s:
+            s["controls"] = {"report_withdrawals": [w for w in s["controls"].get("report_withdrawals", [])
+                                                         if w["report_id"] in visible_reports]}
         s["opinions"], s["notes"], s["followups"] = [], [], []
         return s
 
@@ -318,32 +326,35 @@ class Store:
         with self.transaction(False) as c:
             return self.visible(actor, self._load(c, actor, case_id))
 
+    def _accessible_cases(self, c, actor, search=""):
+        # Verify stored projections before trusting access metadata, including list counts.
+        # One consistent transaction, not a shifting sequence of pagination snapshots.
+        rows = c.execute("SELECT * FROM cases WHERE org_id=? ORDER BY ref_norm,id", (actor["org_id"],)).fetchall()
+        states = []
+        for row in rows:
+            state = json.loads(row["state"])
+            require(state["org_id"] == row["org_id"] and state["id"] == row["id"] and
+                    row["ref_norm"] == normalized(state["case_ref"]), "Case identity projection mismatch")
+            verify_events(self._events(c, state["id"]), self.public_key, state)
+            if may_access(actor, state) and normalized(search) in normalized(state["case_ref"]):
+                states.append(self.visible(actor, state))
+        return states
+
     def list_cases(self, actor, search="", limit=200, offset=0):
         require(1 <= limit <= 200 and offset >= 0, "Invalid pagination", 422)
         with self.transaction(False) as c:
-            rows = c.execute("SELECT state FROM cases WHERE org_id=? AND ref_norm LIKE ? ORDER BY ref_norm",
-                             (actor["org_id"], "%" + normalized(search) + "%")).fetchall()
-            states = [json.loads(r["state"]) for r in rows]
-            if actor["role"] == "lab":
-                states = [s for s in states if any(r["lab_id"] == actor["lab_id"] for r in s["requests"])]
-            result = [self.visible(actor, self._load(c, actor, s["id"])) for s in states[offset:offset + limit]]
-        return {"items": result, "total": len(states), "limit": limit, "offset": offset}
+            states = self._accessible_cases(c, actor, search)
+        return {"items": states[offset:offset + limit], "total": len(states), "limit": limit, "offset": offset}
 
     def all_cases(self, actor):
-        # Bounded queue projections are returned by the HTTP layer, not entire evidence documents.
-        states, offset = [], 0
-        while True:
-            page = self.list_cases(actor, limit=200, offset=offset)
-            states.extend(page["items"])
-            offset += len(page["items"])
-            if offset >= page["total"]:
-                return states
+        with self.transaction(False) as c:
+            return self._accessible_cases(c, actor)
 
     def _append(self, c, actor, case_id, old, action, data):
         eid, recorded = uuid.uuid4().hex, now_iso()
         state = apply(old, action, data, actor, recorded, eid, case_id)
         last = c.execute("SELECT hash FROM events WHERE case_id=? ORDER BY seq DESC LIMIT 1", (case_id,)).fetchone()
-        body = {"schema": 1, "case_id": case_id, "seq": state["version"], "event_id": eid, "actor": actor,
+        body = {"schema": 2, "case_id": case_id, "seq": state["version"], "event_id": eid, "actor": actor,
                 "recorded_at": recorded, "action": action, "data": data,
                 "previous_hash": last["hash"] if last else "0" * 64, "after_digest": digest(state)}
         c.execute("INSERT INTO events VALUES (?,?,?,?,?)", (case_id, state["version"], canonical(body).decode(),
@@ -399,36 +410,51 @@ class Store:
                 return replay
             s = self._load(c, actor, case_id)
             require(s["version"] == expected_version, "Case changed; refresh before submitting (stale version)")
-            if actor["role"] == "examiner" and action in {"collect", "request", "review", "draft", "issue"}:
-                require(s["examiner_id"] == actor["id"], "Only the assigned examiner may perform this action", 403)
-            if action == "request" or (action == "handover" and data["recipient_lab_id"]):
-                lab_id = data.get("lab_id") or data["recipient_lab_id"]
-                self._lab(c, lab_id, actor["org_id"])
-            if action == "handover" and data["recipient_id"]:
-                recipient = c.execute("SELECT * FROM users WHERE id=? AND org_id=? AND active=1",
-                                      (data["recipient_id"], actor["org_id"])).fetchone()
-                require(recipient and recipient["role"] in ROLES["acknowledge"], "Recipient cannot acknowledge custody", 422)
-                self._check_identity(c, "user", recipient["id"], recipient)
-                if recipient["role"] == "lab":
-                    require(any(r["lab_id"] == recipient["lab_id"] and r["specimen_id"] == data["specimen_id"]
-                                for r in s["requests"]), "No examination request for this laboratory")
-            if action == "handover" and data["recipient_lab_id"]:
-                require(any(r["lab_id"] == data["recipient_lab_id"] and r["specimen_id"] == data["specimen_id"]
-                            for r in s["requests"]), "No examination request for this laboratory")
-            if actor["role"] == "lab":
-                if action == "report":
-                    item(self.visible(actor, s), "attachments", data["attachment_id"])
-                    require(item(s, "requests", data["request_id"])["lab_id"] == actor["lab_id"],
-                            "Report is not assigned to your laboratory", 403)
-                if action in {"attach", "seal", "handover"}:
-                    require(any(r["specimen_id"] == data["specimen_id"] and r["lab_id"] == actor["lab_id"]
-                                for r in s["requests"]), "Specimen is not assigned to your laboratory", 403)
+            self._authorize_command(c, actor, s, action, data)
             if blob is not None:
                 require(hashlib.sha256(blob).hexdigest() == data["sha256"] and len(blob) == data["size"],
                         "Attachment content hash/length mismatch", 422)
                 c.execute("INSERT OR IGNORE INTO blobs VALUES (?,?,?)", (actor["org_id"], data["sha256"], blob))
             state, eid = self._append(c, actor, case_id, s, action, data)
             return self._remember(c, actor, key, payload, state, eid)
+
+    def _authorize_command(self, c, actor, s, action, data):
+        if actor["role"] == "examiner" and action in {"collect", "request", "review", "draft", "issue", "correct", "withdraw_report", "withdraw_opinion", "access_policy"}:
+            require(s["examiner_id"] == actor["id"], "Only the assigned examiner may perform this action", 403)
+        if action == "request" or (action == "handover" and data["recipient_lab_id"]):
+            lab_id = data.get("lab_id") or data["recipient_lab_id"]
+            self._lab(c, lab_id, actor["org_id"])
+        if action == "handover" and data["recipient_id"]:
+            recipient = c.execute("SELECT * FROM users WHERE id=? AND org_id=? AND active=1",
+                                  (data["recipient_id"], actor["org_id"])).fetchone()
+            require(recipient and recipient["role"] in ROLES["acknowledge"], "Recipient cannot acknowledge custody", 422)
+            self._check_identity(c, "user", recipient["id"], recipient)
+            if recipient["role"] == "lab":
+                require(any(r["lab_id"] == recipient["lab_id"] and r["specimen_id"] == data["specimen_id"]
+                            for r in s["requests"]), "No examination request for this laboratory")
+        if action == "handover" and data["recipient_lab_id"]:
+            require(any(r["lab_id"] == data["recipient_lab_id"] and r["specimen_id"] == data["specimen_id"]
+                        for r in s["requests"]), "No examination request for this laboratory")
+        if actor["role"] == "lab":
+            if action == "report":
+                item(self.visible(actor, s), "attachments", data["attachment_id"])
+                require(item(s, "requests", data["request_id"])["lab_id"] == actor["lab_id"],
+                        "Report is not assigned to your laboratory", 403)
+            if action in {"attach", "seal", "handover"}:
+                require(any(r["specimen_id"] == data["specimen_id"] and r["lab_id"] == actor["lab_id"]
+                            for r in s["requests"]), "Specimen is not assigned to your laboratory", 403)
+        if action == "access_policy":
+            for uid in data["member_ids"]:
+                user = self._user(c, uid)
+                require(user["org_id"] == actor["org_id"] and user["active"], "Case members must be active department accounts", 422)
+        if action == "handover" and data["recipient_id"]:
+            policy = s.get("controls", {}).get("access", {"mode": "department"})
+            require(policy["mode"] != "restricted" or data["recipient_id"] in policy["member_ids"],
+                    "Recipient needs explicit access to this restricted case", 422)
+        if action == "request_receipt" and actor["role"] == "lab":
+            require(item(s, "requests", data["request_id"])["lab_id"] == actor["lab_id"], "Request belongs to another laboratory", 403)
+            if data["attachment_id"]:
+                item(self.visible(actor, s), "attachments", data["attachment_id"])
 
     def attachment(self, actor, case_id, attachment_id):
         with self.transaction(False) as c:
