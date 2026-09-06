@@ -14,11 +14,13 @@ from fastapi.staticfiles import StaticFiles
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from .domain import (RuleError, blockers, dt, evidence_fingerprint, latest_report, now_iso,
-                     opinion_pending, require)
+                     opinion_pending, require, report_withdrawal, opinion_withdrawal)
 from .documents import document
 from .evidence import export_bundle
-from .models import CaseCreate, Command, LabCreate, Login, MODELS, Upload, UserCreate, UserStatus
+from .models import (CaseCreate, Command, LabCreate, Login, MODELS, Upload, UserCreate, UserStatus,
+                     BatchHandover, ChangePassword)
 from .store import Store
+from .governance import AccessAuditMiddleware
 
 MAX_REQUEST = 8 * 1024 * 1024
 STATIC = Path(__file__).parent / "static"
@@ -66,7 +68,7 @@ class RequestGuard:
                 extra = [(b"cache-control", b"no-store"), (b"x-content-type-options", b"nosniff"),
                          (b"referrer-policy", b"no-referrer"), (b"x-frame-options", b"DENY"),
                          (b"permissions-policy", b"camera=(), microphone=(), geolocation=()"),
-                         (b"x-request-id", uuid.uuid4().hex.encode()),
+                         (b"x-request-id", scope.get("ov_request_id", uuid.uuid4().hex).encode()),
                          (b"content-security-policy", b"default-src 'self'; script-src 'self'; style-src 'self'; "
                           b"img-src 'self' data:; object-src 'none'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'")]
                 if self.secure:
@@ -125,10 +127,11 @@ def create_app(data_dir=None, origin=None, insecure_local=False):
     else:
         require(parsed.scheme == "https", "HTTPS origin required outside explicit loopback demo mode", 503)
     store = Store(data_dir)
-    app = FastAPI(title="OpenViscera", version="0.1.0", docs_url=None, redoc_url=None, openapi_url=None)
+    app = FastAPI(title="OpenViscera", version="0.2.0", docs_url=None, redoc_url=None, openapi_url=None)
     app.state.store = store
     app.add_middleware(RequestGuard, origin=origin, secure=not insecure_local)
     app.add_middleware(TrustedHostMiddleware, allowed_hosts=[parsed.hostname])
+    app.add_middleware(AccessAuditMiddleware, store=store)
 
     @app.exception_handler(RuleError)
     async def rule_error(request, exc):
@@ -141,6 +144,7 @@ def create_app(data_dir=None, origin=None, insecure_local=False):
 
     def auth(request: Request):
         actor, csrf = store.session(request.cookies.get("ov_session"))
+        request.state.actor = actor
         if request.method not in {"GET", "HEAD", "OPTIONS"}:
             require(hmac.compare_digest(request.headers.get("X-CSRF-Token", ""), csrf), "Invalid CSRF token", 403)
         return actor
@@ -149,13 +153,21 @@ def create_app(data_dir=None, origin=None, insecure_local=False):
         return request.headers.get("Idempotency-Key", "")
 
     def enriched(actor, s):
-        return {"case": s, "blockers": blockers(s) if actor["role"] != "lab" else [],
+        return {"case": s,
+                "report_status": {r["id"]: ("withdrawn" if (report_withdrawal(s, r["id"]) or {}).get("status") == "approved"
+                                             else "disputed" if report_withdrawal(s, r["id"]) else
+                                             "superseded" if (latest_report(s, r["request_id"]) or {}).get("id") != r["id"]
+                                             else "reviewed" if r["reviewed_at"] else "received") for r in s["reports"]},
+                "opinion_status": {o["id"]: ("withdrawn" if opinion_withdrawal(s, o["id"]) else
+                                               "issued" if o["issued_at"] else "approved" if o["approved_at"] else "draft")
+                                   for o in s["opinions"]},
+                "blockers": blockers(s) if actor["role"] != "lab" else [],
                 "pending_opinion": opinion_pending(s) if actor["role"] != "lab" else None,
                 "evidence_fingerprint": evidence_fingerprint(s) if actor["role"] != "lab" else None}
 
     @app.get("/healthz")
     def health():
-        return {"status": "ok", "version": "0.1.0"}
+        return {"status": "ok", "version": "0.2.0"}
 
     @app.get("/")
     def index():
@@ -164,6 +176,7 @@ def create_app(data_dir=None, origin=None, insecure_local=False):
     @app.post("/api/login")
     def login(data: Login, request: Request):
         token, csrf, actor = store.login(data.username, data.password, request.client.host if request.client else "unknown")
+        request.state.actor = actor
         response = JSONResponse({"user": actor, "csrf": csrf})
         response.set_cookie("ov_session", token, httponly=True, secure=not insecure_local,
                             samesite="strict", max_age=8 * 3600, path="/")
@@ -205,13 +218,38 @@ def create_app(data_dir=None, origin=None, insecure_local=False):
         return {"openapi": app.openapi(), "commands": {name: model.model_json_schema() for name, model in MODELS.items()}}
 
     @app.get("/api/cases")
-    def cases(search: str = "", limit: int = 200, offset: int = 0, actor=Depends(auth)):
+    def cases(request: Request, search: str = "", limit: int = 200, offset: int = 0, actor=Depends(auth)):
         require(len(search) <= 240, "Search too long", 422)
-        return store.list_cases(actor, search, limit, offset)
+        result = store.list_cases(actor, search, limit, offset)
+        request.state.audit_case_ids = [s["id"] for s in result["items"]]
+        return result
 
     @app.post("/api/cases", status_code=201)
     def create_case(data: CaseCreate, request: Request, actor=Depends(auth)):
-        return store.create_case(actor, data.model_dump(), key(request))
+        result = store.create_case(actor, data.model_dump(), key(request))
+        request.state.audit_case_ids = [result["case"]["id"]]
+        return result
+
+    @app.post("/api/account/password")
+    def change_password(data: ChangePassword, request: Request, actor=Depends(auth)):
+        store.change_password(actor, data.current_password, data.new_password)
+        response = JSONResponse({"ok": True, "reauthentication_required": True})
+        response.delete_cookie("ov_session", path="/", secure=not insecure_local, httponly=True, samesite="strict")
+        return response
+
+    @app.get("/api/admin/access-audit")
+    def access_audit(offset: int = 0, limit: int = 200, actor=Depends(auth)):
+        return store.access_audit(actor, offset, limit)
+
+    @app.get("/api/locate")
+    def locate(request: Request, token: str, actor=Depends(auth)):
+        found = store.locate_specimen(actor, token)
+        request.state.audit_case_ids = [found["case_id"]]
+        return found
+
+    @app.post("/api/cases/{case_id}/batch-handover")
+    def batch_handover(case_id: str, data: BatchHandover, request: Request, actor=Depends(auth)):
+        return store.batch_handover(actor, case_id, data.model_dump(mode="json"), key(request))
 
     @app.get("/api/cases/{case_id}")
     def case(case_id: str, actor=Depends(auth)):
@@ -252,8 +290,10 @@ def create_app(data_dir=None, origin=None, insecure_local=False):
             "Content-Disposition": 'attachment; filename="' + meta["sha256"] + suffix + '"'})
 
     @app.get("/api/dashboard")
-    def dashboard(actor=Depends(auth)):
-        return queue_snapshot(store.all_cases(actor), actor)
+    def dashboard(request: Request, actor=Depends(auth)):
+        states = store.all_cases(actor)
+        request.state.audit_case_ids = [s["id"] for s in states]
+        return queue_snapshot(states, actor)
 
     @app.get("/api/cases/{case_id}/events")
     def events(case_id: str, actor=Depends(auth)):
