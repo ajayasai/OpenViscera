@@ -174,3 +174,83 @@ ROLES = {
 
 class UserStatus(Strict):
     active: bool
+
+
+# Version-2 additive commands. Historic version-1 contracts are unchanged.
+class AccessPolicy(Strict):
+    mode: Literal["department", "restricted"]
+    member_ids: Annotated[list[Identifier], Field(max_length=100)]
+    reason: Note
+
+
+class Correct(Strict):
+    target: Literal["case", "specimen"]
+    target_id: Identifier
+    field: Literal["authority", "description", "preservative", "quantity", "unit"]
+    expected_value: Text
+    replacement: Text
+    reason: Note
+
+
+class CorrectionDecision(Strict):
+    correction_id: Identifier
+    decision: Literal["approve", "reject"]
+    reason: Note
+
+
+class WithdrawReport(Strict):
+    report_id: Identifier
+    reason: Note
+
+
+class WithdrawalDecision(Strict):
+    withdrawal_id: Identifier
+    decision: Literal["approve", "reject"]
+    reason: Note
+
+
+class WithdrawOpinion(Strict):
+    opinion_id: Identifier
+    reason: Note
+
+
+class RequestReceipt(Strict):
+    request_id: Identifier
+    accepted_at: AwareDatetime
+    attachment_id: Identifier | None = None
+    note: Note
+
+
+class RecordReturn(Strict):
+    specimen_id: Identifier
+    attachment_id: Identifier
+    external_sender_name: Text
+    occurred_at: AwareDatetime
+    observed_seal: Text
+    discrepancy: bool = False
+    destination: Text
+    note: Note
+
+
+class BatchHandover(Strict):
+    expected_version: Annotated[int, Field(ge=1)]
+    items: Annotated[list[Handover], Field(min_length=1, max_length=100)]
+    preview: bool = False
+
+
+class ChangePassword(Strict):
+    current_password: Annotated[str, StringConstraints(strip_whitespace=False, min_length=1, max_length=1024)]
+    new_password: Annotated[str, StringConstraints(strip_whitespace=False, min_length=14, max_length=1024)]
+
+
+MODELS.update({
+    "access_policy": AccessPolicy, "correct": Correct, "decide_correction": CorrectionDecision,
+    "withdraw_report": WithdrawReport, "decide_withdrawal": WithdrawalDecision,
+    "withdraw_opinion": WithdrawOpinion, "request_receipt": RequestReceipt, "record_return": RecordReturn,
+})
+ROLES.update({
+    "access_policy": {"admin", "examiner"}, "correct": {"examiner", "coordinator"},
+    "decide_correction": {"reviewer"}, "withdraw_report": {"examiner", "coordinator"},
+    "decide_withdrawal": {"reviewer"}, "withdraw_opinion": {"examiner", "reviewer"},
+    "request_receipt": {"examiner", "coordinator", "lab"}, "record_return": {"examiner", "coordinator"},
+})
