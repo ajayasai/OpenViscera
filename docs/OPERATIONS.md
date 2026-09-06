@@ -38,8 +38,8 @@ A successful restore does not establish that the backup is the newest legitimate
 
 Institutional acceptance must cover the complete specimen-to-opinion flow with realistic synthetic cases, allowed correction and exceptional workflows, access scope, external-receipt policy, independent approval, export handling, account lifecycle, retention/hold/disposal policy, threat modelling and penetration testing, malware handling, recovery drills, realistic concurrency and volume, PDF/label printing, clock synchronization and incident response.
 
-Automated tests are evidence about implemented rules, not accreditation, legal compliance or clinical validation. No production uptime SLA, external integrations, read-access monitoring service, managed hosting or legal certification is included.
+Automated tests are evidence about implemented rules, not accreditation, legal compliance or clinical validation. No production uptime SLA, external integrations, managed security-monitoring service, managed hosting or legal certification is included.
 
 ## Version upgrades
 
-Schema version 1 is explicit. No migration engine is shipped. Back up, retain a checkpoint, test the new release against a copy, verify prior signed bundles and compare heads before any upgrade. Reject an upgrade that silently changes event interpretation. Keep old verification environments for historical evidence when formats evolve.
+Database schema 2 has an explicit additive upgrade from schema 1. Stop the service, back up, retain an external checkpoint and follow [the v0.2 upgrade procedure](V02-UPGRADE.md). Migration verifies existing evidence and unchanged case heads; a frozen v1 reducer preserves old event interpretation. Test against a copy before deployment. Further migrations and key rotation are not implied by this one upgrade.
