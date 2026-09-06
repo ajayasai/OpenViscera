@@ -34,6 +34,8 @@ Later evidence reopens pending work while preserving the issued document. Create
 | Reviewer | Expert review, independent discrepancy resolution, independent opinion approval, supporting notes/evidence. |
 | Auditor | Read-only department review and verified exports. |
 
+Restricted named-member cases additionally require membership, including for administrators and auditors. Administrators and auditors can inspect department-wide access-audit metadata but do not thereby gain access to restricted clinical contents.
+
 The backend is authoritative; hiding a browser button is not the control. Discrepancy resolution rejects reviewers who participated in the transfer. Author/self-approval remains prohibited even when the role model changes.
 
 ## Queues and follow-ups
@@ -44,6 +46,6 @@ Record a manual contact method, note and next follow-up date against a request. 
 
 ## Corrections and unsupported workflows
 
-There is no silent edit/delete for evidence fields or issued opinions. Add a clearly identified corrective case note and follow department procedure; a structured correction/retraction mechanism is not yet implemented. Do not overwrite a wrong laboratory report: preserve it, document the issue and use the correct linked revision where appropriate.
+There is no silent edit/delete for evidence fields or issued opinions. v0.2 adds proposed before/after corrections with independent approval or rejection for specified descriptive fields, plus report and issued-opinion withdrawals. The old values and issued content remain preserved in signed history. See [v0.2 controls](V02-UPGRADE.md) for exactly which fields and transitions are supported. Do not overwrite a wrong laboratory report: preserve it, document the issue and use the correct linked revision where appropriate.
 
-External-laboratory specimen return and additional examinations requested after the original lab receipt do not yet have complete transitions. Do not fabricate a handover or acknowledgement to bypass this limit. The strict opinion gate intentionally has no administrative override or waiver for an outstanding examination in this release; departments requiring interim opinions or justified exclusions need a reviewed extension.
+v0.2 supports evidence-backed external-laboratory specimen returns and explicit acceptance of additional examinations after the original lab receipt. A changed observed return seal triggers a discrepancy and never clears an existing quarantine. Do not fabricate a physical handover to confirm an additional examination. The strict opinion gate intentionally has no administrative override or waiver for an outstanding examination in this release; departments requiring interim opinions or justified exclusions need a reviewed extension.
