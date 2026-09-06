@@ -17,6 +17,7 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 from .domain import RuleError, canonical, digest, normalized, now_iso, require
 from .store import Store, verify_events
+from .governance import verify_access_events
 
 MAX_BUNDLE = 100 * 1024 * 1024
 
@@ -99,6 +100,13 @@ def check_database(store):
         for table, kind, identifier in [("users", "user", "id"), ("labs", "lab", "id"), ("sessions", "session", "hash")]:
             for row in c.execute("SELECT * FROM " + table):
                 store._check_identity(c, kind, row[identifier], row)
+        access_heads = {}
+        if c.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='access_events'").fetchone():
+            for org_row in c.execute("SELECT DISTINCT org_id FROM access_events"):
+                org_id = org_row[0]
+                access = [{"body": json.loads(r["body"]), "hash": r["hash"], "signature": r["signature"]}
+                          for r in c.execute("SELECT * FROM access_events WHERE org_id=? ORDER BY seq", (org_id,))]
+                access_heads[org_id] = verify_access_events(access, store.public_key, org_id)
         previous = "0" * 64
         for row in c.execute("SELECT * FROM administrative_events ORDER BY seq"):
             body = json.loads(row["body"])
@@ -109,7 +117,7 @@ def check_database(store):
                 raise RuleError("Administrative event signature mismatch") from exc
             previous = row["hash"]
     return {"format": "openviscera-checkpoint-v1", "checked_at": now_iso(), "public_key": store.public_b64,
-            "heads": heads, "administrative_head": previous}
+            "heads": heads, "administrative_head": previous, "access_heads": access_heads}
 
 
 def encrypted_backup(store, password):
@@ -151,7 +159,7 @@ def restore_backup(content, password, destination):
             for name in archive.namelist():
                 (stage / name).write_bytes(archive.read(name))
                 os.chmod(stage / name, 0o600)
-        restored = Store(stage)
+        restored = Store(stage, allow_legacy=True)
         check_database(restored)
         # Sessions are intentionally invalidated on restore.
         with restored.transaction() as c:
@@ -159,4 +167,4 @@ def restore_backup(content, password, destination):
         (stage / "public-key.txt").write_text(restored.public_b64 + "\n")
         require(not target.exists(), "Restore target appeared during validation")
         stage.rename(target)
-    return Store(target)
+    return Store(target, allow_legacy=True)
