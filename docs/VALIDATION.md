@@ -1,56 +1,56 @@
-# Initial validation and competitive acceptance plan
+# v0.2 validation results
 
-Evaluation date: **5 September 2026**. Release: **0.1.0**. Dataset: generated synthetic cases only. This is developer-run validation, not independent clinical acceptance, penetration testing, accreditation or a head-to-head comparison with proprietary systems.
+Date: 6 September 2026. Release: 0.2.0. Data: synthetic cases only. This is developer-run validation, not independent clinical acceptance, penetration testing, accreditation or a licensed commercial-product comparison.
 
-## Executed results
+## Executed local results
 
-**105 passed in 26.20 seconds; 96% Python statement coverage (rounded), 1,195 of 1,244 statements covered.** Environment: Linux, Python 3.13.5, FastAPI 0.128.2, Pydantic 2.13.4, cryptography 46.0.4, ReportLab 4.4.9, pytest 9.0.2. Timings are observations from this environment, not performance guarantees.
-
-| Validation area | What was exercised |
-| --- | --- |
-| Complete lifecycle | Collection, request, sealing, account/external dispatch, receipt, report upload, review, draft, independent approval, issue, supplementary handling. |
-| Evidence freshness | Unreviewed/latest report checks, explicit supersession, duplicate-byte rejection, stale approvals, exact report coverage and revision-triggered reopening without changing the issued record. |
-| Custody | Wrong sender/recipient rejection, no unsealed dispatch, no duplicate acknowledgement, timestamp ordering, automatic seal discrepancy and independent resolution. |
-| Linking and uniqueness | Wrong-case and wrong-specimen attachments, laboratory scope, normalized container duplicates across cases, examination duplicates. |
-| Authorization | Seven roles, all auditor mutation denials, assigned examiner restrictions, department isolation, laboratory-filtered data/downloads, self-approval rejection. |
-| Concurrency | Version conflicts, idempotent retries and 16 simultaneous competing writes with exactly one winner. |
-| Tampering | Event/projection changes, invalid signatures, administrative/identity changes, session injection, missing/modified blobs, damaged uniqueness registry, truncated ledger. |
-| Portable verification | Pinned keys and heads, changed archive members, path traversal, exact member/hash checks, deterministic case replay. |
-| Recovery | Authenticated encrypted backup and verified restore, incorrect passphrase/tamper rejection, overwrite refusal, restored-session invalidation. |
-| Web security | Authentication, CSRF, Origin/Host checks, secure-cookie mode, session revocation, persistent throttling, oversized and chunked request bodies, upload format/path restrictions, sanitized validation errors. |
-| Browser | Actual Chromium forms connected to the actual API through the in-process test harness; multi-account complete workflow, report revision, no observed JS errors, desktop and 390-pixel mobile rendering without horizontal overflow. |
-| Documents/package | Five administrative PDF types generated, rendered and visually inspected; wheel and source distribution built locally; three static UI assets verified inside the wheel; JavaScript syntax check passed. |
-
-Commands used for the full test run:
+**169 passed in 47.21 seconds. Python statement coverage: 97.03% (1,636 of 1,686 statements).** This includes the expanded Chromium workflow and 55 dedicated v0.2 tests, plus additional denial cases automatically added to the role matrix. The original event reducer remains byte-for-byte frozen and has a regression digest.
 
 ```bash
-OV_BROWSER_TEST=1 OV_BROWSER_INPROCESS=1 OV_CHROMIUM=/usr/bin/chromium \
-  OV_SCREENSHOT_DIR=/tmp/openviscera-screenshots \
-  pytest tests --cov=openviscera --cov-report=term \
+PYTHONPATH=src OV_BROWSER_TEST=1 OV_BROWSER_INPROCESS=1 \
+  OV_CHROMIUM=/usr/bin/chromium OV_SCREENSHOT_DIR=/tmp/ov-screenshots \
+  python -m pytest tests --cov=openviscera --cov-report=term-missing \
   --cov-report=json:/tmp/coverage.json --junitxml=/tmp/junit.xml
 node --check src/openviscera/static/app.js
+node --check src/openviscera/static/controls.js
 ```
 
-The local browser policy blocks all HTTP navigation. It was not changed. The alternative harness renders the real HTML/CSS/JavaScript in memory and binds browser fetch to a FastAPI TestClient against the real store. This validates UI behavior and application responses, **not** browser enforcement of network cookies, TLS, Origin, CSP or a deployed reverse proxy. Those server controls have separate API tests. The normal HTTP Chromium workflow remains in the test suite and CI definition for a network-enabled environment.
+The local environment uses Linux and Python 3.13.5. Library versions are captured in the release evidence bundle. Timing is an observation, not a performance guarantee. Statement coverage does not imply branch coverage, mutation coverage, or absence of security defects.
 
-An early browser run found an HTML boolean-attribute bug that made the discrepancy checkbox required; that bug was fixed and the full browser workflow rerun successfully. PDF rendering uses deployment-supplied fonts when configured; non-Latin scripts and physical printers were not validated.
+## What the new tests establish
 
-## Not established by these results
+| Area | Executed checks |
+| --- | --- |
+| Restricted cases | Direct reads, list totals, dashboard counts, attachments, PDFs, full exports and QR/container lookups cannot disclose restricted case contents to excluded staff. Administrators have no automatic clinical-read bypass. Revoked users cannot obtain the case through idempotent command replay. |
+| Authorization | Duplicate, cross-department, disabled and missing-owner memberships rejected. Handover recipients must have explicit access to restricted cases. Independent decisions reject the proposer, including under a hypothetical role change. |
+| Controlled corrections | Original field is unchanged until approval; before/after provenance retained; rejection, stale expected values, duplicate proposals, wrong fields and invalid numeric corrections tested. |
+| Withdrawals | A disputed or withdrawn latest report cannot be reviewed or satisfy readiness; no automatic fallback to an older revision; replacements supersede the actual latest revision. Issued opinion withdrawal preserves the original text/approval and reopens work. |
+| External laboratories | Documentary return restores recorded department custody; changed seals remain discrepancies; additional examination acceptance records no fictional physical transfer and requires matching proof for staff transcription. |
+| Batches | Preview changes no case state, commit retains one signed event per specimen, retries are idempotent, invalid later items reject the entire batch, and two concurrent batches have exactly one winner. |
+| Access audit | Reads, exports and handled denials recorded with route templates and opaque IDs; sensitive bodies, passwords and query strings absent; invalid signatures detected; a failed audit append withholds clinical responses; committed writes remain safely retryable by idempotency key. |
+| Password changes | Current password required, incorrect attempts throttled, every old session revoked, old password rejected afterwards. |
+| Migration/recovery | Original schema-1 signatures, issued projection and exported bundle preserved; schema-2 events append after migration; repeat migration is a no-op; failed migration rolls back; v1 backups can be restored and migrated. |
+| Browser | Original lifecycle plus restriction, independent correction and withdrawal, external return, preview/commit batch, specimen lookup, password change and audit page. No observed JavaScript errors; 390-pixel layout has no document-level horizontal overflow. |
 
-No licensed commercial comparison, external penetration test, clinical pilot, regulatory/legal compliance assessment, high-availability test, production volume benchmark, Windows/macOS execution, non-Latin shaping validation, physical barcode-scanner test, malware-scanning integration, or live laboratory integration was performed. Docker and reverse-proxy execution were not verified in the initial environment. CI configuration alone is not evidence that a hosted run has passed.
+A browser run found horizontal overflow after extra account/lookup actions were added. The mobile header was fixed and the browser suite rerun successfully. Audit tables deliberately scroll within their own container on narrow screens.
 
-Coverage is statement coverage, not branch or mutation coverage. A passing safety test proves only the scenarios tested. Service-key signatures are not individual qualified signatures or externally trusted timestamps. Full host/key compromise and whole-deployment rollback without external checkpoints remain outside the protection claim.
+## Browser transport limitation
 
-## Compare fairly with existing systems
+This environment blocks browser HTTP navigation to local services. The real HTML/CSS/JavaScript ran in Chromium and called the real FastAPI app/store through the test suite's in-process transport. This validates UI and application behavior, not browser enforcement of TLS, production cookies, CSP or reverse-proxy configuration. The server controls have separate API tests. GitHub Actions is configured to exercise the normal HTTP browser path on hosted runners; only an actually completed successful run should be cited as hosted validation.
 
-Public product descriptions establish that [LabVantage supports pathologists and medical examiners](https://www.labvantage.com/blog/pathologists-and-medical-examiners/) and [Forensic Advantage offers medical-examiner case management](https://www.forensicadvantage.com/medical-examiner-edition). [SENAITE](https://www.senaite.com/) already supplies open-source laboratory management. These are product descriptions, not independent evidence that any competing product lacks OpenViscera's controls. Their licensed configurations were not inspected.
+## Dispatch microbenchmark
 
-OpenViscera's implementation can be inspected and tested without commercial licensing. The proposed differentiators are department-side external-lab reconciliation, explicit report-to-opinion freshness, independently verifiable full evidence exports, and a small self-hosted stack. **Superiority is a hypothesis requiring comparative evaluation, not a release claim.**
+Command: `PYTHONPATH=src python tools/benchmark_dispatch.py --specimens 25 --repeats 5`.
 
-For a meaningful evaluation, pre-register the same synthetic case set and scripts for every evaluated system/configuration. Include missing acknowledgements, seal mismatches, two specimens with similar identifiers, wrong-case uploads, late reports, superseding reports after issue, concurrent receipt entry, absent examiner, independent approval, disabled users, complete export and verified recovery. Do not give one product a simplified scenario or assume configuration gaps are product impossibilities.
+| Variant | Transactions | Signed events | Median timed service operations |
+| --- | ---: | ---: | ---: |
+| Individual handover commands | 25 | 25 | 264.4 ms |
+| One atomic batch | 1 | 25 | 37.1 ms |
 
-Measure task completion and correction rates, unsafe transitions actually blocked, operator time/clicks, training time, audit/reconstruction completeness, vendor-independent export verification, restore success and recovery time, median/p95 latency under specified concurrency and database size, operational burden, accessibility and deployment cost. Have forensic practitioners and security reviewers score outcomes blind where feasible. Publish scripts, synthetic data, exact versions/settings, failures and uncertainty. Only then make a bounded claim such as "lower median reconciliation time on this benchmark," not "better than all alternatives."
+The median ratio was **7.13×**. Both variants retained pending recipient acknowledgements and passed full signed replay after every run. The same quiescent synthetic store was copied for each trial; trial order alternated. Setup, login, HTTP/TLS, operator time and post-run audit were outside the timer. The raw five-run arrays, environment and implementation are supplied. This result compares two OpenViscera execution paths, not OpenViscera with a commercial product, and is not a large-department capacity benchmark.
 
-## Highest-priority work before institutional production
+## Deliberately unproven
 
-Complete structured corrections/retractions, external specimen returns and late additional-examination receipt transitions; agree interim-opinion/exclusion policy; add restricted-case ACLs, SSO/MFA and password lifecycle; build an appropriate malware quarantine/release pipeline; implement complete access auditing, key rotation and database migrations; validate non-Latin PDFs and label printers; establish approved retention/hold/disposal behavior; conduct external security and forensic-practitioner review; measure realistic capacity and consider PostgreSQL/object storage only with preserved atomicity and verification guarantees.
+No licensed head-to-head product test, external penetration test, clinical pilot, regulatory certification, high-availability test, production-load benchmark, physical scanner/printer test, Unicode shaping study, malware-scanning integration or live laboratory/instrument integration was completed. Container/TLS-proxy execution was not validated locally. Old correctly signed bundles can be stale; whole-deployment rollback and key compromise still need controls outside the application.
+
+Read the [primary-source competitive review](V02-COMPETITIVE-REVIEW.md) and [upgrade/security boundaries](V02-UPGRADE.md). Future comparisons should use pre-registered scenarios and report unsafe transitions, operator effort, audit reconstruction, recovery, failure modes and uncertainty—not an unsupported claim to be better than every alternative.
