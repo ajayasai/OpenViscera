@@ -4,7 +4,7 @@ Date: 6 September 2026. Release: 0.2.0. Data: synthetic cases only. This is deve
 
 ## Executed local results
 
-**169 passed in 47.21 seconds. Python statement coverage: 97.03% (1,636 of 1,686 statements).** This includes the expanded Chromium workflow and 55 dedicated v0.2 tests, plus additional denial cases automatically added to the role matrix. The original event reducer remains byte-for-byte frozen and has a regression digest.
+**169 passed in 47.21 seconds. Python statement coverage: 97.03% (1,636 of 1,686 statements).** This includes the expanded Chromium workflow and 56 dedicated v0.2 tests, plus additional denial cases automatically added to the role matrix. The original event reducer remains byte-for-byte frozen and has a regression digest.
 
 ```bash
 PYTHONPATH=src OV_BROWSER_TEST=1 OV_BROWSER_INPROCESS=1 \
@@ -37,6 +37,10 @@ A browser run found horizontal overflow after extra account/lookup actions were 
 ## Browser transport limitation
 
 This environment blocks browser HTTP navigation to local services. The real HTML/CSS/JavaScript ran in Chromium and called the real FastAPI app/store through the test suite's in-process transport. This validates UI and application behavior, not browser enforcement of TLS, production cookies, CSP or reverse-proxy configuration. The server controls have separate API tests. GitHub Actions is configured to exercise the normal HTTP browser path on hosted runners; only an actually completed successful run should be cited as hosted validation.
+
+## Hosted validation
+
+[GitHub Actions run 34023098220](https://github.com/ajayasai/OpenViscera/actions/runs/34023098220) completed successfully for code commit `710f34eddba03028b74f63e97ba3fec18b9beb77`. Python 3.11, 3.12 and 3.13 test/package jobs passed. The separate Chromium job passed the expanded UI workflow over normal HTTP against the running application, without the local in-process transport. This establishes a hosted browser integration run, not a production TLS deployment or independent clinical/security certification.
 
 ## Dispatch microbenchmark
 
