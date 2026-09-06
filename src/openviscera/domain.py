@@ -1,97 +1,75 @@
-"""Deterministic, replayable workflow. Persistence and network I/O belong elsewhere."""
+"""Versioned reducers and fail-closed case controls. Version 1 is deliberately frozen."""
 import copy
-import hashlib
-import json
-import unicodedata
-from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation
+
+from . import domain_v1 as legacy
+from .domain_v1 import (RuleError, canonical, digest, dt, item, normalized, now_iso, require, timestamp)  # noqa: F401
+
+NEW_ACTIONS = {"access_policy", "correct", "decide_correction", "withdraw_report", "decide_withdrawal",
+               "withdraw_opinion", "request_receipt", "record_return"}
 
 
-class RuleError(Exception):
-    def __init__(self, message, status=409):
-        self.message, self.status = message, status
-        super().__init__(message)
+def controls(state):
+    return state.get("controls", {})
 
 
-def require(condition, message, status=409):
-    if not condition:
-        raise RuleError(message, status)
+def may_access(actor, state):
+    """Restrict case existence, not just the screen. Role is never an ACL bypass."""
+    if actor["org_id"] != state["org_id"]:
+        return False
+    policy = controls(state).get("access", {"mode": "department"})
+    if policy["mode"] == "restricted" and actor["id"] not in policy["member_ids"]:
+        return False
+    return actor["role"] != "lab" or any(r["lab_id"] == actor["lab_id"] for r in state["requests"])
 
 
-def canonical(value):
-    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False).encode()
+def report_withdrawal(state, report_id):
+    return next((w for w in reversed(controls(state).get("report_withdrawals", []))
+                 if w["report_id"] == report_id and w["status"] in {"pending", "approved"}), None)
 
 
-def digest(value):
-    return hashlib.sha256(canonical(value)).hexdigest()
-
-
-def normalized(value):
-    return unicodedata.normalize("NFKC", value).strip().casefold()
-
-
-def now_iso():
-    return datetime.now(timezone.utc).isoformat()
-
-
-def dt(value):
-    return datetime.fromisoformat(value.replace("Z", "+00:00"))
-
-
-def timestamp(value, recorded, after=None):
-    parsed = dt(value)
-    require(parsed.tzinfo is not None, "Timezone is required", 422)
-    require(parsed <= dt(recorded), "Event time cannot be in the future", 422)
-    if after:
-        require(parsed >= dt(after), "Event time precedes the preceding custody event", 422)
-
-
-def item(state, collection, identifier):
-    found = next((x for x in state[collection] if x["id"] == identifier), None)
-    require(found is not None, f"Unknown {collection} item for this case", 404)
-    return found
+def opinion_withdrawal(state, opinion_id):
+    return next((w for w in controls(state).get("opinion_withdrawals", []) if w["opinion_id"] == opinion_id), None)
 
 
 def latest_report(state, request_id):
-    reports = [r for r in state["reports"] if r["request_id"] == request_id]
-    return reports[-1] if reports else None
+    # Never fall back silently to an older revision when the newest one is withdrawn.
+    report = legacy.latest_report(state, request_id)
+    return None if report and report_withdrawal(state, report["id"]) else report
 
 
 def evidence_fingerprint(state):
-    """Administrative follow-ups and opinion actions do not alter the evidence snapshot."""
-    return digest({k: state[k] for k in ("case_ref", "authority", "examiner_id", "specimens", "requests",
-                                       "transfers", "reports", "attachments", "notes")})
+    base = legacy.evidence_fingerprint(state)
+    clinical = {k: v for k, v in controls(state).items()
+                if k in {"corrections", "report_withdrawals", "opinion_withdrawals"} and v}
+    return digest({"base": base, "controls": clinical}) if clinical else base
 
 
 def blockers(state):
-    reasons = []
-    if not state["requests"]:
-        reasons.append("No laboratory examinations requested")
-    for specimen in state["specimens"]:
-        if specimen["quarantined"]:
-            reasons.append(f'Unresolved discrepancy: {specimen["container_id"]}')
-        if not any(r["specimen_id"] == specimen["id"] for r in state["requests"]):
-            reasons.append(f'No examination requested for container: {specimen["container_id"]}')
-    for transfer in state["transfers"]:
-        if transfer["acknowledged_at"] is None:
-            reasons.append(f'Unacknowledged handover: {transfer["id"]}')
+    reasons = legacy.blockers(state)
+    for correction in controls(state).get("corrections", []):
+        if correction["status"] == "pending":
+            reasons.append("Correction awaiting independent decision: " + correction["id"])
+    for withdrawal in controls(state).get("report_withdrawals", []):
+        if withdrawal["status"] == "pending":
+            reasons.append("Report withdrawal awaiting independent decision: " + withdrawal["report_id"])
     for request in state["requests"]:
-        if not request["received_at"]:
-            reasons.append(f'Laboratory receipt missing: {request["examination"]} ({request["id"]})')
-        report = latest_report(state, request["id"])
-        if report is None:
-            reasons.append(f'Report outstanding: {request["examination"]} ({request["id"]})')
-        elif report["reviewed_at"] is None:
-            reasons.append(f'Latest report unreviewed: {report["laboratory_reference"]}')
+        last = legacy.latest_report(state, request["id"])
+        if last and report_withdrawal(state, last["id"]):
+            reasons.append("Current report unavailable or withdrawn: " + last["laboratory_reference"])
     return reasons
 
 
 def opinion_pending(state):
     issued = [o for o in state["opinions"] if o["issued_at"]]
-    return not issued or issued[-1]["evidence_fingerprint"] != evidence_fingerprint(state)
+    return (not issued or bool(opinion_withdrawal(state, issued[-1]["id"])) or
+            issued[-1]["evidence_fingerprint"] != evidence_fingerprint(state))
 
 
 def opinion_ready(state, opinion):
-    require(not blockers(state), "Opinion blocked: " + "; ".join(blockers(state)))
+    reasons = blockers(state)
+    require(not reasons, "Opinion blocked: " + "; ".join(reasons))
+    require(not opinion_withdrawal(state, opinion["id"]), "Opinion is withdrawn")
     require(opinion["evidence_fingerprint"] == evidence_fingerprint(state),
             "Opinion is stale: evidence changed; create a new draft")
     wanted = {latest_report(state, r["id"])["id"] for r in state["requests"]}
@@ -101,122 +79,158 @@ def opinion_ready(state, opinion):
             "First issued opinion must be final; subsequent opinions must be supplementary")
 
 
-def apply(state, action, data, actor, recorded, event_id, case_id=None):
-    """Apply a validated command to a copy. Identifiers and time come from the signed event."""
+def _records(state, name):
+    return state.setdefault("controls", {}).setdefault(name, [])
+
+
+def _record(state, name, identifier):
+    found = next((x for x in controls(state).get(name, []) if x["id"] == identifier), None)
+    require(found is not None, "Unknown control record for this case", 404)
+    return found
+
+
+def _correction_target(state, correction):
+    if correction["target"] == "case":
+        require(correction["target_id"] == state["id"] and correction["field"] == "authority",
+                "Only requesting-authority text can be corrected on a case", 422)
+        return state
+    require(correction["field"] in {"description", "preservative", "quantity", "unit"},
+            "This specimen field cannot be corrected through this operation", 422)
+    return item(state, "specimens", correction["target_id"])
+
+
+def _proof(state, attachment_id, specimen_id):
+    attachment = item(state, "attachments", attachment_id)
+    require(attachment["specimen_id"] == specimen_id, "Receipt evidence belongs to another specimen")
+    return attachment
+
+
+def _currently_at_lab(state, specimen, lab_id):
+    if specimen["holder_id"] == "external:" + lab_id:
+        return True
+    # v1 records already link acknowledged laboratory holders to their requests.
+    return any(r["specimen_id"] == specimen["id"] and r["lab_id"] == lab_id and r["received_at"]
+               and r["received_by"] == specimen["holder_id"] for r in state["requests"])
+
+
+def apply(state, action, data, actor, recorded, event_id, case_id=None, schema=2):
+    """Only schema=1 invokes the frozen reducer; signed v2 rules are explicitly versioned."""
+    require(schema in {1, 2}, "Unsupported event schema")
+    if schema == 1:
+        return legacy.apply(state, action, data, actor, recorded, event_id, case_id)
     uid = actor["id"]
     if action == "create":
-        return {"id": case_id, "org_id": actor["org_id"], **data, "created_at": recorded,
-                "version": 1, "specimens": [], "requests": [], "transfers": [], "reports": [],
-                "attachments": [], "opinions": [], "notes": [], "followups": []}
+        return legacy.apply(state, action, data, actor, recorded, event_id, case_id)
+    if action not in NEW_ACTIONS and action not in {"approve", "issue", "draft"}:
+        if action == "review":
+            require(not report_withdrawal(state, data["report_id"]), "Withdrawn or disputed report cannot be reviewed")
+        s = legacy.apply(state, action, data, actor, recorded, event_id, case_id)
+        if action == "report":
+            # A pending withdrawal cannot be defeated by submitting another report first.
+            require(not any(w["status"] == "pending" and item(state, "reports", w["report_id"])["request_id"] == data["request_id"]
+                            for w in controls(state).get("report_withdrawals", [])),
+                    "Resolve the pending report withdrawal before registering a replacement")
+        if action in {"acknowledge", "record_receipt"}:
+            transfer = item(s, "transfers", data["transfer_id"])
+            transfer["receipt_lab_id"] = transfer.get("recipient_lab_id") or actor.get("lab_id")
+        return s
     s = copy.deepcopy(state)
-    eid = event_id
-    if action == "collect":
-        timestamp(data["collected_at"], recorded)
-        require(not any(normalized(x["container_id"]) == normalized(data["container_id"])
-                        for x in s["specimens"]), "Container identifier already exists")
-        s["specimens"].append({"id": eid, **data, "collected_by": uid, "holder_id": uid,
-                               "last_custody_at": data["collected_at"], "seal_ref": None,
-                               "seal_history": [], "quarantined": False})
-    elif action == "seal":
-        sp = item(s, "specimens", data["specimen_id"])
-        require(sp["holder_id"] == uid, "Only the recorded custodian may seal", 403)
-        require(not any(t["specimen_id"] == sp["id"] and not t["acknowledged_at"]
-                        for t in s["transfers"]), "Cannot reseal during a pending handover")
-        timestamp(data["occurred_at"], recorded, sp["last_custody_at"])
-        sp["seal_history"].append({**data, "actor_id": uid, "recorded_at": recorded})
-        sp["seal_ref"] = data["seal_ref"]
-        sp["last_custody_at"] = data["occurred_at"]
-    elif action == "request":
-        item(s, "specimens", data["specimen_id"])
-        require(not any(r["specimen_id"] == data["specimen_id"] and r["lab_id"] == data["lab_id"]
-                        and normalized(r["examination"]) == normalized(data["examination"])
-                        for r in s["requests"]), "Duplicate examination request")
-        # A new examination requires its own receipt confirmation, even for an existing container.
-        s["requests"].append({"id": eid, **data, "created_at": recorded, "created_by": uid,
-                              "received_at": None, "received_by": None})
-    elif action == "handover":
-        sp = item(s, "specimens", data["specimen_id"])
-        require(sp["holder_id"] == uid, "Sender is not the current recorded custodian", 403)
-        require(data["recipient_id"] != uid, "Sender and recipient must differ")
-        require(sp["seal_ref"], "Seal the specimen before handover")
-        require(not sp["quarantined"], "Resolve the discrepancy before another handover")
-        require(not any(t["specimen_id"] == sp["id"] and not t["acknowledged_at"]
-                        for t in s["transfers"]), "A handover is already awaiting acknowledgement")
-        timestamp(data["occurred_at"], recorded, sp["last_custody_at"])
-        s["transfers"].append({"id": eid, **data, "sender_id": uid, "seal_ref": sp["seal_ref"],
-                               "acknowledged_at": None, "discrepancy": False, "resolution": None})
-        sp["last_custody_at"] = data["occurred_at"]
-    elif action in {"acknowledge", "record_receipt"}:
-        transfer = item(s, "transfers", data["transfer_id"])
-        external = action == "record_receipt"
-        if external:
-            require(transfer["recipient_lab_id"], "This transfer requires the named user's acknowledgement")
-            proof = item(s, "attachments", data["attachment_id"])
-            require(proof["specimen_id"] == transfer["specimen_id"], "Receipt evidence belongs to another specimen")
-            transfer["receipt_evidence_id"] = data["attachment_id"]
-            transfer["external_recipient_name"] = data["recipient_name"]
-        else:
-            require(transfer["recipient_id"] == uid, "Only the named recipient may acknowledge", 403)
-        require(not transfer["acknowledged_at"], "Handover is already acknowledged")
-        timestamp(data["occurred_at"], recorded, transfer["occurred_at"])
-        sp = item(s, "specimens", transfer["specimen_id"])
-        discrepancy = data["discrepancy"] or data["observed_seal"] != transfer["seal_ref"]
-        transfer.update(acknowledged_at=data["occurred_at"], acknowledged_by=uid,
-                        acknowledgement_note=data["note"], observed_seal=data["observed_seal"],
-                        discrepancy=discrepancy)
-        holder = "external:" + transfer["recipient_lab_id"] if external else uid
-        sp.update(holder_id=holder, last_custody_at=data["occurred_at"], location=transfer["destination"],
-                  quarantined=discrepancy)
-        receipt_lab = transfer["recipient_lab_id"] if external else actor.get("lab_id")
-        if receipt_lab:
-            for request in s["requests"]:
-                if request["specimen_id"] == sp["id"] and request["lab_id"] == receipt_lab:
-                    if request["received_at"] is None:
-                        request.update(received_at=data["occurred_at"], received_by=uid,
-                                       receipt_source="documented_external_receipt" if external else "authenticated_recipient")
-    elif action == "resolve":
-        transfer = item(s, "transfers", data["transfer_id"])
-        require(transfer["discrepancy"] and transfer["resolution"] is None, "No open discrepancy")
-        require(uid not in (transfer["sender_id"], transfer["recipient_id"], transfer.get("acknowledged_by")),
-                "Discrepancy resolution requires an independent reviewer", 403)
-        transfer["resolution"] = {"reviewer_id": uid, "reason": data["reason"], "at": recorded}
-        sp = item(s, "specimens", transfer["specimen_id"])
-        sp["quarantined"] = any(t["specimen_id"] == sp["id"] and t["discrepancy"]
-                                 and not t["resolution"] for t in s["transfers"])
-    elif action == "attach":
-        item(s, "specimens", data["specimen_id"])
-        s["attachments"].append({"id": eid, **data, "uploaded_by": uid, "uploaded_at": recorded})
-    elif action == "report":
-        request = item(s, "requests", data["request_id"])
-        attachment = item(s, "attachments", data["attachment_id"])
-        require(attachment["specimen_id"] == request["specimen_id"],
-                "Wrong specimen: attachment and examination request do not match")
-        require(attachment["media_type"] == "application/pdf", "Laboratory report must be a PDF attachment")
-        current = latest_report(s, request["id"])
-        require(data["supersedes"] == (current["id"] if current else None),
-                "Revision must explicitly supersede the latest report")
-        require(not any(r["attachment_id"] == attachment["id"] for r in s["reports"]),
-                "Attachment already registered as a report")
-        require(not any(r["request_id"] == request["id"] and
-                        item(s, "attachments", r["attachment_id"])["sha256"] == attachment["sha256"]
-                        for r in s["reports"]), "Identical report bytes already registered for this request")
-        timestamp(data["received_at"], recorded,
-                  item(s, "specimens", request["specimen_id"])["collected_at"])
-        s["reports"].append({"id": eid, **data, "revision": current["revision"] + 1 if current else 1,
-                            "lab_id": request["lab_id"], "registered_by": uid, "reviewed_at": None,
-                            "reviewed_by": None, "review_note": None})
-    elif action == "review":
+    if action == "access_policy":
+        require(actor["role"] in {"admin", "examiner"}, "Access-policy permission required", 403)
+        require(actor["role"] != "examiner" or s["examiner_id"] == uid, "Only assigned examiner may manage case access", 403)
+        require(len(data["member_ids"]) == len(set(data["member_ids"])), "Duplicate case members", 422)
+        require(data["mode"] != "restricted" or s["examiner_id"] in data["member_ids"],
+                "Restricted cases must retain their assigned examiner", 422)
+        require(data["mode"] != "department" or not data["member_ids"], "Department access cannot include a member list", 422)
+        # Managers cannot accidentally remove their own only path back into the record.
+        require(data["mode"] != "restricted" or uid in data["member_ids"], "Policy author must retain access", 422)
+        s.setdefault("controls", {})["access"] = {**data, "changed_by": uid, "changed_at": recorded}
+    elif action == "correct":
+        target = _correction_target(s, data)
+        require(str(target[data["field"]]) == data["expected_value"], "Correction target changed; refresh first")
+        require(data["replacement"] != data["expected_value"], "Correction must change the recorded value", 422)
+        replacement = data["replacement"]
+        if data["field"] == "quantity":
+            try:
+                number = Decimal(replacement)
+                require(number.is_finite() and 0 < number <= 1000000 and number.as_tuple().exponent >= -6,
+                        "Corrected quantity must be positive, bounded and have at most six decimal places", 422)
+                replacement = str(number)
+            except InvalidOperation as exc:
+                raise RuleError("Invalid corrected quantity", 422) from exc
+        records = _records(s, "corrections")
+        require(not any(x["status"] == "pending" and x["target_id"] == data["target_id"] and
+                        x["field"] == data["field"] for x in records), "A correction for this field is already pending")
+        records.append({"id": event_id, **data, "replacement": replacement, "proposed_by": uid,
+                        "proposed_at": recorded, "status": "pending"})
+    elif action == "decide_correction":
+        correction = _record(s, "corrections", data["correction_id"])
+        require(correction["status"] == "pending", "Correction already decided")
+        require(uid != correction["proposed_by"], "Correction requires an independent reviewer", 403)
+        target = _correction_target(s, correction)
+        if data["decision"] == "approve":
+            require(str(target[correction["field"]]) == correction["expected_value"], "Correction target changed; cannot apply stale proposal")
+            target[correction["field"]] = correction["replacement"]
+        correction.update(status="approved" if data["decision"] == "approve" else "rejected",
+                          decided_by=uid, decided_at=recorded, decision_reason=data["reason"])
+    elif action == "withdraw_report":
         report = item(s, "reports", data["report_id"])
-        require(latest_report(s, report["request_id"])["id"] == report["id"], "Cannot review a superseded report")
-        require(report["reviewed_at"] is None, "Report is already reviewed; append a case note for clarification")
-        report.update(reviewed_at=recorded, reviewed_by=uid, review_note=data["note"])
+        require(not report_withdrawal(s, report["id"]), "Report already withdrawn or awaiting a decision")
+        _records(s, "report_withdrawals").append({"id": event_id, **data, "status": "pending",
+                                                  "proposed_by": uid, "proposed_at": recorded})
+    elif action == "decide_withdrawal":
+        withdrawal = _record(s, "report_withdrawals", data["withdrawal_id"])
+        require(withdrawal["status"] == "pending", "Withdrawal already decided")
+        require(uid != withdrawal["proposed_by"], "Withdrawal requires an independent reviewer", 403)
+        withdrawal.update(status="approved" if data["decision"] == "approve" else "rejected",
+                          decided_by=uid, decided_at=recorded, decision_reason=data["reason"])
+    elif action == "withdraw_opinion":
+        opinion = item(s, "opinions", data["opinion_id"])
+        require(opinion["issued_at"], "Only an issued opinion can be withdrawn")
+        require(not opinion_withdrawal(s, opinion["id"]), "Opinion already withdrawn")
+        _records(s, "opinion_withdrawals").append({"id": event_id, **data, "withdrawn_by": uid, "withdrawn_at": recorded})
+    elif action == "request_receipt":
+        request = item(s, "requests", data["request_id"])
+        specimen = item(s, "specimens", request["specimen_id"])
+        require(request["received_at"] is None, "Request receipt already confirmed")
+        require(_currently_at_lab(s, specimen, request["lab_id"]), "Specimen is not recorded at this laboratory")
+        require(not any(t["specimen_id"] == specimen["id"] and not t["acknowledged_at"] for t in s["transfers"]),
+                "Cannot accept another request during a pending handover")
+        timestamp(data["accepted_at"], recorded, request["created_at"])
+        if actor["role"] == "lab":
+            require(actor["lab_id"] == request["lab_id"], "Request is assigned to another laboratory", 403)
+        else:
+            require(data["attachment_id"], "Documentary acceptance evidence is required", 422)
+        if data["attachment_id"]:
+            _proof(s, data["attachment_id"], specimen["id"])
+        request.update(received_at=data["accepted_at"], received_by=uid,
+                       receipt_source="authenticated_additional_request" if actor["role"] == "lab" else "documented_additional_request",
+                       acceptance_evidence_id=data["attachment_id"], acceptance_note=data["note"])
+    elif action == "record_return":
+        sp = item(s, "specimens", data["specimen_id"])
+        require(sp["holder_id"].startswith("external:"), "Only an externally held specimen can be returned this way")
+        require(not any(t["specimen_id"] == sp["id"] and not t["acknowledged_at"] for t in s["transfers"]),
+                "Cannot record a return while a handover is pending")
+        _proof(s, data["attachment_id"], sp["id"])
+        timestamp(data["occurred_at"], recorded, sp["last_custody_at"])
+        discrepancy = data["discrepancy"] or data["observed_seal"] != sp["seal_ref"]
+        s["transfers"].append({"id": event_id, "specimen_id": sp["id"], "sender_id": sp["holder_id"],
+                               "recipient_id": uid, "recipient_lab_id": None, "recipient_name": actor["display_name"],
+                               "external_sender_name": data["external_sender_name"], "occurred_at": data["occurred_at"],
+                               "destination": data["destination"], "note": data["note"], "seal_ref": sp["seal_ref"],
+                               "observed_seal": data["observed_seal"], "acknowledged_at": data["occurred_at"],
+                               "acknowledged_by": uid, "acknowledgement_note": data["note"],
+                               "receipt_evidence_id": data["attachment_id"], "receipt_source": "documented_external_return",
+                               "discrepancy": discrepancy, "resolution": None})
+        sp["seal_history"].append({"kind": "external_seal_observation", "seal_ref": data["observed_seal"],
+                                    "occurred_at": data["occurred_at"], "recorded_at": recorded,
+                                    "actor_id": uid, "reason": data["note"], "attachment_id": data["attachment_id"]})
+        sp.update(holder_id=uid, last_custody_at=data["occurred_at"], location=data["destination"],
+                  seal_ref=data["observed_seal"], quarantined=sp["quarantined"] or discrepancy)
     elif action == "draft":
-        require(len(set(data["report_ids"])) == len(data["report_ids"]), "Duplicate report references")
-        for rid in data["report_ids"]:
-            item(s, "reports", rid)
-        s["opinions"].append({"id": eid, **data, "author_id": uid, "created_at": recorded,
-                              "evidence_fingerprint": evidence_fingerprint(s), "approved_by": None,
-                              "approved_at": None, "issued_at": None})
+        s = legacy.apply(s, action, data, actor, recorded, event_id, case_id)
+        s["opinions"][-1].update(evidence_fingerprint=evidence_fingerprint(state), workflow_version=2)
+        return s
     elif action == "approve":
         opinion = item(s, "opinions", data["opinion_id"])
         require(uid != opinion["author_id"], "Author cannot approve their own opinion", 403)
@@ -228,13 +242,5 @@ def apply(state, action, data, actor, recorded, event_id, case_id=None):
         require(opinion["approved_at"] and not opinion["issued_at"], "Opinion needs approval and must not already be issued")
         opinion_ready(s, opinion)
         opinion["issued_at"] = recorded
-    elif action == "note":
-        s["notes"].append({"id": eid, **data, "actor_id": uid, "at": recorded})
-    elif action == "followup":
-        item(s, "requests", data["request_id"])
-        require(dt(data["next_due_at"]) >= dt(recorded), "Next follow-up must not be in the past", 422)
-        s["followups"].append({"id": eid, **data, "actor_id": uid, "at": recorded})
-    else:
-        raise RuleError("Unknown command", 422)
     s["version"] += 1
     return s
