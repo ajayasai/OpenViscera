@@ -1,62 +1,47 @@
-"""Versioned reducers and fail-closed case controls. Version 1 is deliberately frozen."""
+"""Version-three workflow. Earlier reducers remain byte-for-byte frozen for replay."""
 import copy
-from decimal import Decimal, InvalidOperation
 
-from . import domain_v1 as legacy
-from .domain_v1 import (RuleError, canonical, digest, dt, item, normalized, now_iso, require, timestamp)  # noqa: F401
+from . import domain_v2 as v2
+from .domain_v2 import (RuleError, canonical, digest, dt, item, normalized, now_iso, require,
+                        timestamp, controls, may_access, latest_report, report_withdrawal,
+                        opinion_withdrawal)  # noqa: F401
 
-NEW_ACTIONS = {"access_policy", "correct", "decide_correction", "withdraw_report", "decide_withdrawal",
-               "withdraw_opinion", "request_receipt", "record_return"}
-
-
-def controls(state):
-    return state.get("controls", {})
-
-
-def may_access(actor, state):
-    """Restrict case existence, not just the screen. Role is never an ACL bypass."""
-    if actor["org_id"] != state["org_id"]:
-        return False
-    policy = controls(state).get("access", {"mode": "department"})
-    if policy["mode"] == "restricted" and actor["id"] not in policy["member_ids"]:
-        return False
-    return actor["role"] != "lab" or any(r["lab_id"] == actor["lab_id"] for r in state["requests"])
+LIFECYCLE_ACTIONS = {
+    "propose_reassignment", "decide_reassignment", "propose_retention", "decide_retention",
+    "place_hold", "request_hold_release", "decide_hold_release", "propose_disposal",
+    "decide_disposal", "cancel_disposal", "record_disposal",
+}
+PHYSICAL_ACTIONS = {"seal", "request", "handover", "acknowledge", "record_receipt",
+                    "request_receipt", "record_return"}
 
 
-def report_withdrawal(state, report_id):
-    return next((w for w in reversed(controls(state).get("report_withdrawals", []))
-                 if w["report_id"] == report_id and w["status"] in {"pending", "approved"}), None)
+def records(state, name):
+    return controls(state).get(name, [])
 
 
-def opinion_withdrawal(state, opinion_id):
-    return next((w for w in controls(state).get("opinion_withdrawals", []) if w["opinion_id"] == opinion_id), None)
+def record(state, name, identifier):
+    found = next((r for r in records(state, name) if r["id"] == identifier), None)
+    require(found is not None, "Unknown lifecycle record for this case", 404)
+    return found
 
 
-def latest_report(state, request_id):
-    # Never fall back silently to an older revision when the newest one is withdrawn.
-    report = legacy.latest_report(state, request_id)
-    return None if report and report_withdrawal(state, report["id"]) else report
+def append_record(state, name, value):
+    state.setdefault("controls", {}).setdefault(name, []).append(value)
 
 
 def evidence_fingerprint(state):
-    base = legacy.evidence_fingerprint(state)
-    clinical = {k: v for k, v in controls(state).items()
-                if k in {"corrections", "report_withdrawals", "opinion_withdrawals"} and v}
-    return digest({"base": base, "controls": clinical}) if clinical else base
+    # Administrative certificates do not pretend to be clinical evidence. They remain
+    # hashed/signed/exported, and are forbidden as laboratory-report attachments.
+    if any(a.get("purpose") == "administrative" for a in state["attachments"]):
+        state = {**state, "attachments": [a for a in state["attachments"]
+                                         if a.get("purpose") != "administrative"]}
+    return v2.evidence_fingerprint(state)
 
 
 def blockers(state):
-    reasons = legacy.blockers(state)
-    for correction in controls(state).get("corrections", []):
-        if correction["status"] == "pending":
-            reasons.append("Correction awaiting independent decision: " + correction["id"])
-    for withdrawal in controls(state).get("report_withdrawals", []):
-        if withdrawal["status"] == "pending":
-            reasons.append("Report withdrawal awaiting independent decision: " + withdrawal["report_id"])
-    for request in state["requests"]:
-        last = legacy.latest_report(state, request["id"])
-        if last and report_withdrawal(state, last["id"]):
-            reasons.append("Current report unavailable or withdrawn: " + last["laboratory_reference"])
+    reasons = v2.blockers(state)
+    if any(r["status"] == "pending" for r in records(state, "reassignments")):
+        reasons.append("Examiner reassignment awaiting independent decision")
     return reasons
 
 
@@ -74,163 +59,195 @@ def opinion_ready(state, opinion):
             "Opinion is stale: evidence changed; create a new draft")
     wanted = {latest_report(state, r["id"])["id"] for r in state["requests"]}
     require(set(opinion["report_ids"]) == wanted, "Opinion must cover every current report revision")
-    issued = [o for o in state["opinions"] if o["issued_at"]]
-    require(opinion["kind"] == ("supplementary" if issued else "final"),
+    require(opinion["kind"] == ("supplementary" if any(o["issued_at"] for o in state["opinions"]) else "final"),
             "First issued opinion must be final; subsequent opinions must be supplementary")
 
 
-def _records(state, name):
-    return state.setdefault("controls", {}).setdefault(name, [])
+def disposed(state, specimen_id):
+    return next((d for d in records(state, "disposals")
+                 if d["specimen_id"] == specimen_id and d["status"] == "completed"), None)
 
 
-def _record(state, name, identifier):
-    found = next((x for x in controls(state).get(name, []) if x["id"] == identifier), None)
-    require(found is not None, "Unknown control record for this case", 404)
-    return found
+def retention(state, specimen_id):
+    return next((r for r in reversed(records(state, "retentions"))
+                 if r["specimen_id"] == specimen_id and r["status"] == "approved"), None)
 
 
-def _correction_target(state, correction):
-    if correction["target"] == "case":
-        require(correction["target_id"] == state["id"] and correction["field"] == "authority",
-                "Only requesting-authority text can be corrected on a case", 422)
-        return state
-    require(correction["field"] in {"description", "preservative", "quantity", "unit"},
-            "This specimen field cannot be corrected through this operation", 422)
-    return item(state, "specimens", correction["target_id"])
+def active_holds(state, specimen_id):
+    return [h for h in records(state, "holds")
+            if h["status"] == "active" and h["specimen_id"] in {None, specimen_id}]
 
 
-def _proof(state, attachment_id, specimen_id):
-    attachment = item(state, "attachments", attachment_id)
-    require(attachment["specimen_id"] == specimen_id, "Receipt evidence belongs to another specimen")
-    return attachment
+def disposal_fingerprint(state, specimen_id):
+    """Any intervening custody/policy/hold change requires a fresh disposal approval."""
+    return digest({"evidence": evidence_fingerprint(state),
+                   "retentions": [r for r in records(state, "retentions") if r["specimen_id"] == specimen_id],
+                   "holds": [h for h in records(state, "holds") if h["specimen_id"] in {None, specimen_id}],
+                   "hold_releases": [r for r in records(state, "hold_releases")
+                                     if record(state, "holds", r["hold_id"])["specimen_id"] in {None, specimen_id}],
+                   "reassignments": records(state, "reassignments")})
 
 
-def _currently_at_lab(state, specimen, lab_id):
-    if specimen["holder_id"] == "external:" + lab_id:
-        return True
-    # v1 records already link acknowledged laboratory holders to their requests.
-    return any(r["specimen_id"] == specimen["id"] and r["lab_id"] == lab_id and r["received_at"]
-               and r["received_by"] == specimen["holder_id"] for r in state["requests"])
+def disposal_blockers(state, specimen_id, at, actor_id=None):
+    """An administrative gate, never a determination of legal disposal authority."""
+    sp = item(state, "specimens", specimen_id)
+    reasons = []
+    if disposed(state, specimen_id):
+        return ["Specimen already recorded as disposed"]
+    plan = retention(state, specimen_id)
+    if not plan:
+        reasons.append("No independently approved retention instruction")
+    elif dt(at) < dt(plan["retain_until"]):
+        reasons.append("Retention deadline has not elapsed")
+    if any(r["specimen_id"] == specimen_id and r["status"] == "pending" for r in records(state, "retentions")):
+        reasons.append("Retention change awaiting independent decision")
+    if active_holds(state, specimen_id):
+        reasons.append("Active preservation hold")
+    if sp["holder_id"].startswith("external:"):
+        reasons.append("Specimen is recorded at an external laboratory")
+    if actor_id is not None and sp["holder_id"] != actor_id:
+        reasons.append("Only the recorded local custodian may dispose")
+    if not sp["seal_ref"]:
+        reasons.append("No recorded specimen seal")
+    reasons.extend(blockers(state))
+    if opinion_pending(state):
+        reasons.append("Current evidence has no current issued opinion")
+    return list(dict.fromkeys(reasons))
 
 
-def apply(state, action, data, actor, recorded, event_id, case_id=None, schema=2):
-    """Only schema=1 invokes the frozen reducer; signed v2 rules are explicitly versioned."""
-    require(schema in {1, 2}, "Unsupported event schema")
-    if schema == 1:
-        return legacy.apply(state, action, data, actor, recorded, event_id, case_id)
+def lifecycle_snapshot(state, at=None, actor_id=None):
+    at = at or now_iso()
+    specimens = []
+    for sp in state["specimens"]:
+        plan = retention(state, sp["id"])
+        completed = disposed(state, sp["id"])
+        pending = next((p for p in reversed(records(state, "disposals"))
+                        if p["specimen_id"] == sp["id"] and p["status"] in {"pending", "approved"}), None)
+        reasons = disposal_blockers(state, sp["id"], at, actor_id)
+        stale = bool(pending and pending["snapshot"] != disposal_fingerprint(state, sp["id"]))
+        specimens.append({"specimen_id": sp["id"], "container_id": sp["container_id"],
+                          "retention": plan, "holds": active_holds(state, sp["id"]),
+                          "disposed": completed, "proposal": pending, "proposal_stale": stale,
+                          "blockers": reasons, "eligible_for_proposal": not reasons and not pending,
+                          "eligible_to_record": bool(pending and pending["status"] == "approved"
+                                                     and not stale and not reasons),
+                          "retention_due": bool(plan and dt(plan["retain_until"]) <= dt(at) and not completed)})
+    return {"generated_at": at, "specimens": specimens,
+            "pending_reassignments": [r for r in records(state, "reassignments") if r["status"] == "pending"],
+            "pending_retentions": [r for r in records(state, "retentions") if r["status"] == "pending"],
+            "pending_hold_releases": [r for r in records(state, "hold_releases") if r["status"] == "pending"]}
+
+
+def _decision(target, data, actor, recorded):
+    require(target["status"] == "pending", "Proposal already decided")
+    require(actor["id"] != target["proposed_by"], "An independent reviewer must decide the proposal", 403)
+    target.update(status="approved" if data["decision"] == "approve" else "rejected",
+                  decided_by=actor["id"], decided_at=recorded, decision_reason=data["reason"])
+
+
+def _require_disposal_ready(state, sid, at, actor_id=None):
+    reasons = disposal_blockers(state, sid, at, actor_id)
+    require(not reasons, "Disposal blocked: " + "; ".join(reasons))
+
+
+def apply(state, action, data, actor, recorded, event_id, case_id=None, schema=3):
+    require(schema in {1, 2, 3}, "Unsupported event schema")
+    if schema < 3:
+        return v2.apply(state, action, data, actor, recorded, event_id, case_id, schema=schema)
     uid = actor["id"]
-    if action == "create":
-        return legacy.apply(state, action, data, actor, recorded, event_id, case_id)
-    if action not in NEW_ACTIONS and action not in {"approve", "issue", "draft"}:
-        if action == "review":
-            require(not report_withdrawal(state, data["report_id"]), "Withdrawn or disputed report cannot be reviewed")
-        s = legacy.apply(state, action, data, actor, recorded, event_id, case_id)
-        if action == "report":
-            # A pending withdrawal cannot be defeated by submitting another report first.
-            require(not any(w["status"] == "pending" and item(state, "reports", w["report_id"])["request_id"] == data["request_id"]
-                            for w in controls(state).get("report_withdrawals", [])),
-                    "Resolve the pending report withdrawal before registering a replacement")
+    if action in PHYSICAL_ACTIONS:
+        sid = data.get("specimen_id")
         if action in {"acknowledge", "record_receipt"}:
-            transfer = item(s, "transfers", data["transfer_id"])
-            transfer["receipt_lab_id"] = transfer.get("recipient_lab_id") or actor.get("lab_id")
+            sid = item(state, "transfers", data["transfer_id"])["specimen_id"]
+        elif action == "request_receipt":
+            sid = item(state, "requests", data["request_id"])["specimen_id"]
+        require(not disposed(state, sid), "Specimen is recorded as disposed; physical workflow cannot resume")
+    if action == "report":
+        require(item(state, "attachments", data["attachment_id"]).get("purpose") != "administrative",
+                "Administrative attachment cannot be registered as a laboratory report", 422)
+    if action not in LIFECYCLE_ACTIONS | {"draft", "approve", "issue"}:
+        return v2.apply(state, action, data, actor, recorded, event_id, case_id, schema=2)
+    if action == "draft":
+        s = v2.apply(state, action, data, actor, recorded, event_id, case_id, schema=2)
+        s["opinions"][-1].update(evidence_fingerprint=evidence_fingerprint(state), workflow_version=3)
         return s
     s = copy.deepcopy(state)
-    if action == "access_policy":
-        require(actor["role"] in {"admin", "examiner"}, "Access-policy permission required", 403)
-        require(actor["role"] != "examiner" or s["examiner_id"] == uid, "Only assigned examiner may manage case access", 403)
-        require(len(data["member_ids"]) == len(set(data["member_ids"])), "Duplicate case members", 422)
-        require(data["mode"] != "restricted" or s["examiner_id"] in data["member_ids"],
-                "Restricted cases must retain their assigned examiner", 422)
-        require(data["mode"] != "department" or not data["member_ids"], "Department access cannot include a member list", 422)
-        # Managers cannot accidentally remove their own only path back into the record.
-        require(data["mode"] != "restricted" or uid in data["member_ids"], "Policy author must retain access", 422)
-        s.setdefault("controls", {})["access"] = {**data, "changed_by": uid, "changed_at": recorded}
-    elif action == "correct":
-        target = _correction_target(s, data)
-        require(str(target[data["field"]]) == data["expected_value"], "Correction target changed; refresh first")
-        require(data["replacement"] != data["expected_value"], "Correction must change the recorded value", 422)
-        replacement = data["replacement"]
-        if data["field"] == "quantity":
-            try:
-                number = Decimal(replacement)
-                require(number.is_finite() and 0 < number <= 1000000 and number.as_tuple().exponent >= -6,
-                        "Corrected quantity must be positive, bounded and have at most six decimal places", 422)
-                replacement = str(number)
-            except InvalidOperation as exc:
-                raise RuleError("Invalid corrected quantity", 422) from exc
-        records = _records(s, "corrections")
-        require(not any(x["status"] == "pending" and x["target_id"] == data["target_id"] and
-                        x["field"] == data["field"] for x in records), "A correction for this field is already pending")
-        records.append({"id": event_id, **data, "replacement": replacement, "proposed_by": uid,
-                        "proposed_at": recorded, "status": "pending"})
-    elif action == "decide_correction":
-        correction = _record(s, "corrections", data["correction_id"])
-        require(correction["status"] == "pending", "Correction already decided")
-        require(uid != correction["proposed_by"], "Correction requires an independent reviewer", 403)
-        target = _correction_target(s, correction)
+    proposed = {"id": event_id, **data, "proposed_by": uid, "proposed_at": recorded, "status": "pending"}
+    if action == "propose_reassignment":
+        require(data["new_examiner_id"] != s["examiner_id"], "Select a different examiner", 422)
+        require(not any(r["status"] == "pending" for r in records(s, "reassignments")), "Reassignment already pending")
+        append_record(s, "reassignments", {**proposed, "previous_examiner_id": s["examiner_id"]})
+    elif action == "decide_reassignment":
+        target = record(s, "reassignments", data["reassignment_id"])
+        _decision(target, data, actor, recorded)
         if data["decision"] == "approve":
-            require(str(target[correction["field"]]) == correction["expected_value"], "Correction target changed; cannot apply stale proposal")
-            target[correction["field"]] = correction["replacement"]
-        correction.update(status="approved" if data["decision"] == "approve" else "rejected",
-                          decided_by=uid, decided_at=recorded, decision_reason=data["reason"])
-    elif action == "withdraw_report":
-        report = item(s, "reports", data["report_id"])
-        require(not report_withdrawal(s, report["id"]), "Report already withdrawn or awaiting a decision")
-        _records(s, "report_withdrawals").append({"id": event_id, **data, "status": "pending",
-                                                  "proposed_by": uid, "proposed_at": recorded})
-    elif action == "decide_withdrawal":
-        withdrawal = _record(s, "report_withdrawals", data["withdrawal_id"])
-        require(withdrawal["status"] == "pending", "Withdrawal already decided")
-        require(uid != withdrawal["proposed_by"], "Withdrawal requires an independent reviewer", 403)
-        withdrawal.update(status="approved" if data["decision"] == "approve" else "rejected",
-                          decided_by=uid, decided_at=recorded, decision_reason=data["reason"])
-    elif action == "withdraw_opinion":
-        opinion = item(s, "opinions", data["opinion_id"])
-        require(opinion["issued_at"], "Only an issued opinion can be withdrawn")
-        require(not opinion_withdrawal(s, opinion["id"]), "Opinion already withdrawn")
-        _records(s, "opinion_withdrawals").append({"id": event_id, **data, "withdrawn_by": uid, "withdrawn_at": recorded})
-    elif action == "request_receipt":
-        request = item(s, "requests", data["request_id"])
-        specimen = item(s, "specimens", request["specimen_id"])
-        require(request["received_at"] is None, "Request receipt already confirmed")
-        require(_currently_at_lab(s, specimen, request["lab_id"]), "Specimen is not recorded at this laboratory")
-        require(not any(t["specimen_id"] == specimen["id"] and not t["acknowledged_at"] for t in s["transfers"]),
-                "Cannot accept another request during a pending handover")
-        timestamp(data["accepted_at"], recorded, request["created_at"])
-        if actor["role"] == "lab":
-            require(actor["lab_id"] == request["lab_id"], "Request is assigned to another laboratory", 403)
-        else:
-            require(data["attachment_id"], "Documentary acceptance evidence is required", 422)
-        if data["attachment_id"]:
-            _proof(s, data["attachment_id"], specimen["id"])
-        request.update(received_at=data["accepted_at"], received_by=uid,
-                       receipt_source="authenticated_additional_request" if actor["role"] == "lab" else "documented_additional_request",
-                       acceptance_evidence_id=data["attachment_id"], acceptance_note=data["note"])
-    elif action == "record_return":
+            require(s["examiner_id"] == target["previous_examiner_id"], "Examiner changed; proposal is stale")
+            s["examiner_id"] = target["new_examiner_id"]
+    elif action == "propose_retention":
         sp = item(s, "specimens", data["specimen_id"])
-        require(sp["holder_id"].startswith("external:"), "Only an externally held specimen can be returned this way")
-        require(not any(t["specimen_id"] == sp["id"] and not t["acknowledged_at"] for t in s["transfers"]),
-                "Cannot record a return while a handover is pending")
-        _proof(s, data["attachment_id"], sp["id"])
-        timestamp(data["occurred_at"], recorded, sp["last_custody_at"])
-        discrepancy = data["discrepancy"] or data["observed_seal"] != sp["seal_ref"]
-        s["transfers"].append({"id": event_id, "specimen_id": sp["id"], "sender_id": sp["holder_id"],
-                               "recipient_id": uid, "recipient_lab_id": None, "recipient_name": actor["display_name"],
-                               "external_sender_name": data["external_sender_name"], "occurred_at": data["occurred_at"],
-                               "destination": data["destination"], "note": data["note"], "seal_ref": sp["seal_ref"],
-                               "observed_seal": data["observed_seal"], "acknowledged_at": data["occurred_at"],
-                               "acknowledged_by": uid, "acknowledgement_note": data["note"],
-                               "receipt_evidence_id": data["attachment_id"], "receipt_source": "documented_external_return",
-                               "discrepancy": discrepancy, "resolution": None})
-        sp["seal_history"].append({"kind": "external_seal_observation", "seal_ref": data["observed_seal"],
-                                    "occurred_at": data["occurred_at"], "recorded_at": recorded,
-                                    "actor_id": uid, "reason": data["note"], "attachment_id": data["attachment_id"]})
-        sp.update(holder_id=uid, last_custody_at=data["occurred_at"], location=data["destination"],
-                  seal_ref=data["observed_seal"], quarantined=sp["quarantined"] or discrepancy)
-    elif action == "draft":
-        s = legacy.apply(s, action, data, actor, recorded, event_id, case_id)
-        s["opinions"][-1].update(evidence_fingerprint=evidence_fingerprint(state), workflow_version=2)
-        return s
+        require(not disposed(s, sp["id"]), "Cannot change retention after recorded disposal")
+        require(dt(data["retain_until"]) >= dt(sp["collected_at"]), "Retention deadline precedes collection", 422)
+        require(not any(r["specimen_id"] == sp["id"] and r["status"] == "pending" for r in records(s, "retentions")),
+                "A retention change is already pending")
+        append_record(s, "retentions", {**proposed, "supersedes_id": (retention(s, sp["id"]) or {}).get("id")})
+    elif action == "decide_retention":
+        target = record(s, "retentions", data["retention_id"])
+        if data["decision"] == "approve":
+            require(not disposed(s, target["specimen_id"]), "Cannot change retention after recorded disposal")
+            require((retention(s, target["specimen_id"]) or {}).get("id") == target["supersedes_id"],
+                    "Retention instruction changed; proposal is stale")
+        _decision(target, data, actor, recorded)
+    elif action == "place_hold":
+        if data["specimen_id"]:
+            item(s, "specimens", data["specimen_id"])
+            require(not disposed(s, data["specimen_id"]), "Cannot place a physical hold on an already disposed specimen")
+        append_record(s, "holds", {"id": event_id, **data, "placed_by": uid, "placed_at": recorded, "status": "active"})
+    elif action == "request_hold_release":
+        hold = record(s, "holds", data["hold_id"])
+        require(hold["status"] == "active", "Hold is already released")
+        require(not any(r["hold_id"] == hold["id"] and r["status"] == "pending" for r in records(s, "hold_releases")),
+                "Hold release is already pending")
+        append_record(s, "hold_releases", proposed)
+    elif action == "decide_hold_release":
+        target = record(s, "hold_releases", data["release_id"])
+        hold = record(s, "holds", target["hold_id"])
+        require(hold["status"] == "active", "Hold is already released")
+        _decision(target, data, actor, recorded)
+        if data["decision"] == "approve":
+            hold.update(status="released", released_at=recorded, released_by=uid, release_id=target["id"])
+    elif action == "propose_disposal":
+        sid = data["specimen_id"]
+        _require_disposal_ready(s, sid, recorded, uid)
+        require(not any(r["specimen_id"] == sid and r["status"] in {"pending", "approved"}
+                        for r in records(s, "disposals")), "Cancel or decide the outstanding disposal proposal first")
+        append_record(s, "disposals", {**proposed, "snapshot": disposal_fingerprint(s, sid)})
+    elif action == "decide_disposal":
+        target = record(s, "disposals", data["disposal_id"])
+        if data["decision"] == "approve":
+            _require_disposal_ready(s, target["specimen_id"], recorded)
+            require(target["snapshot"] == disposal_fingerprint(s, target["specimen_id"]),
+                    "Disposal proposal is stale; cancel and propose again")
+        _decision(target, data, actor, recorded)
+    elif action == "cancel_disposal":
+        target = record(s, "disposals", data["disposal_id"])
+        require(target["status"] in {"pending", "approved"}, "Disposal cannot be cancelled in its current state")
+        target.update(status="cancelled", cancelled_by=uid, cancelled_at=recorded, cancellation_reason=data["reason"])
+    elif action == "record_disposal":
+        target = record(s, "disposals", data["disposal_id"])
+        require(target["status"] == "approved", "Disposal requires independent approval")
+        require(target["decided_by"] != uid, "Approver cannot record their own disposal execution", 403)
+        sid = target["specimen_id"]
+        _require_disposal_ready(s, sid, recorded, uid)
+        require(target["snapshot"] == disposal_fingerprint(s, sid), "Disposal approval is stale; cancel and propose again")
+        proof = item(s, "attachments", data["attachment_id"])
+        require(proof["specimen_id"] == sid and proof.get("purpose") == "administrative",
+                "Disposal needs a matching administrative certificate attachment", 422)
+        timestamp(data["occurred_at"], recorded, target["decided_at"])
+        timestamp(data["occurred_at"], recorded, item(s, "specimens", sid)["last_custody_at"])
+        require(dt(data["occurred_at"]) >= dt(retention(s, sid)["retain_until"]),
+                "Disposal time precedes the retention deadline", 422)
+        target.update(status="completed", executed_by=uid, executed_at=data["occurred_at"], recorded_at=recorded,
+                      attachment_id=proof["id"], execution_note=data["note"])
     elif action == "approve":
         opinion = item(s, "opinions", data["opinion_id"])
         require(uid != opinion["author_id"], "Author cannot approve their own opinion", 403)

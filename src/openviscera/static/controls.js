@@ -11,7 +11,7 @@ window.ovLocate=()=>form("Find specimen by label or scanner",[field("token","Con
 
 window.ovBatch=()=>{
  const original=S.current.case;
- const eligible=original.specimens.filter(sp=>sp.holder_id===S.user.id&&!sp.quarantined&&sp.seal_ref&&!original.transfers.some(t=>t.specimen_id===sp.id&&!t.acknowledged_at));
+ const eligible=original.specimens.filter(sp=>!window.ovDisposed(sp)&&sp.holder_id===S.user.id&&!sp.quarantined&&sp.seal_ref&&!original.transfers.some(t=>t.specimen_id===sp.id&&!t.acknowledged_at));
  const recipients=S.catalog.users.filter(u=>u.active&&u.id!==S.user.id&&["examiner","coordinator","courier","lab"].includes(u.role));
  let previewed=null;
  const transform=data=>({expected_version:original.version,items:data.specimen_ids.map(id=>({specimen_id:id,recipient_id:data.recipient_id,occurred_at:data.occurred_at,destination:data.destination,note:data.note}))});

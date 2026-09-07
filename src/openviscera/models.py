@@ -82,6 +82,7 @@ class Resolve(Strict):
 
 
 class Attach(Strict):
+    purpose: Literal["evidence", "administrative"] = "evidence"
     specimen_id: Identifier
     filename: Text
     media_type: Literal["application/pdf", "image/png", "image/jpeg", "text/plain"]
@@ -129,6 +130,7 @@ class Command(Strict):
 
 
 class Upload(Strict):
+    purpose: Literal["evidence", "administrative"] = "evidence"
     expected_version: Annotated[int, Field(ge=1)]
     specimen_id: Identifier
     filename: Text
@@ -253,4 +255,89 @@ ROLES.update({
     "decide_correction": {"reviewer"}, "withdraw_report": {"examiner", "coordinator"},
     "decide_withdrawal": {"reviewer"}, "withdraw_opinion": {"examiner", "reviewer"},
     "request_receipt": {"examiner", "coordinator", "lab"}, "record_return": {"examiner", "coordinator"},
+})
+
+
+# Version-3 administrative lifecycle commands; no automatic retention policy.
+class Reassignment(Strict):
+    new_examiner_id: Identifier
+    reason: Note
+
+
+class ReassignmentDecision(Strict):
+    reassignment_id: Identifier
+    decision: Literal["approve", "reject"]
+    reason: Note
+
+
+class Retention(Strict):
+    specimen_id: Identifier
+    retain_until: AwareDatetime
+    authority_reference: Text
+    reason: Note
+
+
+class RetentionDecision(Strict):
+    retention_id: Identifier
+    decision: Literal["approve", "reject"]
+    reason: Note
+
+
+class PreservationHold(Strict):
+    specimen_id: Identifier | None = None
+    authority_reference: Text
+    reason: Note
+
+
+class HoldRelease(Strict):
+    hold_id: Identifier
+    authority_reference: Text
+    reason: Note
+
+
+class HoldReleaseDecision(Strict):
+    release_id: Identifier
+    decision: Literal["approve", "reject"]
+    reason: Note
+
+
+class Disposal(Strict):
+    specimen_id: Identifier
+    authority_reference: Text
+    method: Text
+    reason: Note
+
+
+class DisposalDecision(Strict):
+    disposal_id: Identifier
+    decision: Literal["approve", "reject"]
+    reason: Note
+
+
+class CancelDisposal(Strict):
+    disposal_id: Identifier
+    reason: Note
+
+
+class RecordDisposal(Strict):
+    disposal_id: Identifier
+    attachment_id: Identifier
+    occurred_at: AwareDatetime
+    note: Note
+
+
+MODELS.update({
+    "propose_reassignment": Reassignment, "decide_reassignment": ReassignmentDecision,
+    "propose_retention": Retention, "decide_retention": RetentionDecision,
+    "place_hold": PreservationHold, "request_hold_release": HoldRelease,
+    "decide_hold_release": HoldReleaseDecision, "propose_disposal": Disposal,
+    "decide_disposal": DisposalDecision, "cancel_disposal": CancelDisposal, "record_disposal": RecordDisposal,
+})
+ROLES.update({
+    "propose_reassignment": {"admin", "examiner", "coordinator"}, "decide_reassignment": {"reviewer"},
+    "propose_retention": {"examiner", "coordinator"}, "decide_retention": {"reviewer"},
+    "place_hold": {"examiner", "coordinator", "reviewer"},
+    "request_hold_release": {"examiner", "coordinator", "reviewer"}, "decide_hold_release": {"reviewer"},
+    "propose_disposal": {"examiner", "coordinator"}, "decide_disposal": {"reviewer"},
+    "cancel_disposal": {"examiner", "coordinator", "reviewer"}, "record_disposal": {"examiner", "coordinator"},
 })

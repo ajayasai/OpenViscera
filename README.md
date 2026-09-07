@@ -2,28 +2,27 @@
 
 **Every specimen. Every next step.** A self-hosted forensic-medicine department workbench for specimen dispatch, custody reconciliation, external laboratory reports, and pending final or supplementary opinions.
 
-**Status: v0.2.0 — tested workflow/security upgrade, not a clinically validated production system.** Human experts enter preservative details, review results, and write opinions. OpenViscera does not interpret laboratory findings, recommend preservatives, infer causes of death, or generate medical conclusions.
+**Status: v0.3.0 — tested retention, preservation and reassignment upgrade; not a clinically validated production system.** Human experts enter preservative details, review results, and write opinions. OpenViscera does not interpret laboratory findings, recommend preservatives, infer causes of death, or generate medical conclusions.
 
-## New in v0.2
+## New in v0.3
 
-This release closes concrete limitations in the original pilot rather than making an untested claim to beat every commercial system.
+OpenViscera now follows the physical specimen beyond the laboratory return, with explicit retention instructions, preservation holds and independently reviewed disposal records. Expiry is a review task, never an automatic destruction trigger.
 
 | Improvement | Implemented behavior |
 | --- | --- |
-| Restricted case access | Explicit named members; no implicit administrator bypass for clinical contents. Enforced on direct reads, lists/counts, queues, downloads, exports and scanner lookup. |
-| Signed access audit | Department-specific HTTP access chains record handled reads, exports and denied requests without case narratives, passwords or query strings. Sensitive responses are withheld if audit append fails. |
-| Controlled corrections | Before/after specimen or requesting-authority corrections need an independent reviewer. Original values and both decisions remain in signed history. |
-| Report/opinion withdrawal | Report disputes and independent withdrawal decisions; no silent revival of an older revision. Issued opinions can be withdrawn without erasing their original text or approvals. |
-| Complete return path | Documentary external-laboratory returns record the external sender and authenticated local receiver; seal discrepancies remain explicit. |
-| Additional examinations | A new request for a specimen already at the lab can receive its own documented/authenticated acceptance without inventing a physical handover. |
-| Atomic dispatch batches | Preview and commit up to 100 handovers in one case/transaction. Any invalid item rejects the whole batch; every container retains its own signed event and outstanding acknowledgement. |
-| Scanner lookup | Find a container using its identifier or an opaque OpenViscera QR payload. The same case and laboratory permissions apply. |
-| Password lifecycle | Current-password-verified change, persistent failed-change throttling and revocation of every existing session. |
-| Explicit upgrade | Additive v1-to-v2 database migration, a frozen v1 reducer and schema-aware replay preserve existing signatures and issued records. |
+| Retention instructions | Human-entered deadline and authority reference; every instruction or change requires independent review. Pending changes block disposal. No hardcoded legal retention period. |
+| Preservation holds | Immediate specimen-specific or whole-case hold, including later-collected specimens. Release requires a documented request and another reviewer; a request alone does not release a hold. |
+| Disposal control | Local custodian proposes; independent reviewer approves; custodian records actual completion with a matching original administrative certificate. Gates are rechecked at proposal, approval and completion. |
+| Stale-approval protection | Evidence, custody, retention, hold/release or reassignment changes invalidate the proposal. Releasing a later hold does not revive an earlier approval: cancel and propose again. |
+| Physical-workflow closure | Completed disposal blocks new requests, resealing, handover and receipt actions for that specimen. Reports, issued opinions, attachments and signed history are never deleted. Later laboratory evidence can still reopen opinion work. |
+| Examiner reassignment | Active replacement examiner must already have restricted-case access. Independent approval changes the assignment; previous opinions remain intact and supplementary opinion work reopens. Pending reassignment blocks opinion approval and issue. |
+| Eighth work queue | Missing retention instructions, elapsed deadlines, pending decisions and stale disposal approvals are visible alongside the seven existing clinical/dispatch queues. |
+| Browser workflows | A dedicated Lifecycle tab exposes every new command, original decisions, blockers and completion history. Department/laboratory access boundaries apply to API, queues and scanner lookup. |
+| Historical compatibility | Explicit schema-1/schema-2 to schema-3 migration; both older reducers remain byte-for-byte frozen. Existing case heads, issued records and signatures are unchanged. |
 
-**Measured validation:** 169 tests passed, 97% Python statement coverage (1,636 of 1,686 statements), and an expanded real Chromium UI test using an in-process API transport. An internal 25-container benchmark measured a median **264.4 ms for individual handovers versus 37.1 ms for an atomic batch (7.13×)** over five repetitions. Both modes produced 25 signed events and passed full replay. This measures store operations, not transport, operator time, production capacity or performance against a commercial product. Raw results and methodology accompany the release validation artifacts; the benchmark is reproducible with `python tools/benchmark_dispatch.py`.
+**Validation:** see [the current executed results](docs/VALIDATION.md), [operating semantics and upgrade procedure](docs/V03-UPGRADE.md), and [the primary-source competitive review and acceptance plan](docs/V03-COMPETITIVE-REVIEW.md). The source, tests and workflow are implemented; superiority over commercial products has not been established by a licensed head-to-head test.
 
-**Existing installations:** stop the old service, back up, install v0.2, then run `openviscera migrate --data ./var`. The server refuses unmigrated stores. Read [upgrade and control semantics](docs/V02-UPGRADE.md), [validation](docs/VALIDATION.md), and the [primary-source competitive review](docs/V02-COMPETITIVE-REVIEW.md).
+The v0.2 release remains documented in [its upgrade guide](docs/V02-UPGRADE.md) and [historical validation record](docs/V02-VALIDATION.md). Its restricted-case permissions, signed access audit, independently reviewed corrections/withdrawals, external returns, atomic dispatch batches and password lifecycle remain in this release.
 
 ## What works
 
@@ -31,7 +30,7 @@ This release closes concrete limitations in the original pilot rather than makin
 | --- | --- |
 | Case and specimen records | Case reference, authority, assigned examiner, priority; container, quantity, unit, description, examiner-entered preservative, collection time and location. Department-wide normalized container uniqueness. |
 | Custody | Seal history, current-custodian handover, named-user acknowledgement, evidence-backed external-lab receipt, automatic seal-mismatch discrepancy, independent resolution. Sending is not receiving. |
-| Seven work queues | Dispatch, receipt reconciliation, outstanding reports, examiner review, pending opinions, custody discrepancies, and scheduled manual follow-ups. Search and case pagination. |
+| Eight work queues | Dispatch, receipt reconciliation, outstanding reports, examiner review, pending opinions, custody discrepancies, manual follow-ups, and storage/retention review. Search and case pagination. |
 | Report lifecycle | Received, reviewed and incorporated are separate. Exact specimen/request links, original attachment hashes, explicit supersession, duplicate-byte rejection, preserved old versions. |
 | Opinion control | Human-authored drafts, independent reviewer approval, assigned-examiner issue, complete current-report coverage, current-evidence checks at approval AND issue. Later evidence reopens pending work without rewriting an issued opinion. |
 | Documents | QR specimen label, dispatch covering letter, handover receipt, chronology and opinion PDF; original evidence downloads; portable signed case bundle. |
@@ -75,12 +74,12 @@ A report may be received before the physical receipt has been reconciled. That d
 python -m pip install -e '.[dev]'
 pytest --cov=openviscera --cov-report=term-missing
 python -m playwright install chromium
-OV_BROWSER_TEST=1 pytest tests/test_browser.py
+OV_BROWSER_TEST=1 pytest tests/test_browser.py tests/test_v3_browser.py
 ```
 
 For PowerShell, set `$env:OV_BROWSER_TEST="1"` before invoking pytest. The browser suite exercises actual forms and the actual API, including different accounts, issuing an opinion, and revision-triggered reopening.
 
-Current local evaluation: **169 tests passed, 97% Python statement coverage**. Chromium exercised case restriction, independent correction/withdrawal decisions, external return, previewed batch dispatch, scanner lookup, password change and audit viewing as well as the original lifecycle. Browser transport used the documented in-process harness because this environment blocks local HTTP navigation; server controls have separate HTTP API tests. The GitHub Actions browser job is configured to use the normal network path. See [validation details](docs/VALIDATION.md) for precise scope.
+The browser suites cover the original workflow and the new hold/release/retention/disposal and reassignment forms, including a narrow mobile layout. See [validation details](docs/VALIDATION.md) for exact counts, coverage, transport limitations and hosted results. Test success is not clinical acceptance, legal certification or proof of safety against every possible input.
 
 ## Verify exported evidence independently
 
@@ -106,13 +105,15 @@ Backup passphrases are prompted, not accepted as command-line arguments. Backups
 
 This is **not** advertised as the first open-source specimen manager or as proven better than every proprietary product. [LabVantage](https://www.labvantage.com/blog/pathologists-and-medical-examiners/) and [Forensic Advantage](https://www.forensicadvantage.com/medical-examiner-edition) address broader established forensic workflows; [SENAITE](https://www.senaite.com/) already provides open-source laboratory management. No licensed head-to-head product evaluation has been performed.
 
-OpenViscera's implemented focus is the department-side gap around external laboratories: explainable queues, acknowledgement reconciliation, evidence-linked review, stale-opinion protection and independently verifiable exports. [The comparison and acceptance plan](docs/VALIDATION.md) defines how to evaluate these advantages without inventing competitor limitations.
+OpenViscera's implemented focus is the department-side gap around external laboratories: explainable queues, acknowledgement reconciliation, evidence-linked review, stale-opinion protection and independently verifiable exports. [The comparison and acceptance plan](docs/V03-COMPETITIVE-REVIEW.md) defines how to evaluate these advantages without inventing competitor limitations.
 
 ## Documentation and limits
 
 [Workflow and permissions](docs/WORKFLOW.md) · [Architecture](docs/ARCHITECTURE.md) · [Deployment and recovery](docs/OPERATIONS.md) · [Validation](docs/VALIDATION.md) · [Security policy](SECURITY.md) · [Contributing](CONTRIBUTING.md)
 
-Known limits include SQLite/single-process deployment, no HA or measured large-department capacity, no SSO/MFA or forgotten-password recovery, no antivirus/content-disarm pipeline, no laboratory/instrument connectors, no automatic email delivery, and no retention/disposal workflow. The database is not encrypted at rest by the application. Restricted-case membership needs careful administration because no emergency bypass or general examiner-reassignment workflow is provided. Already exported copies are not automatically recalled when an opinion is withdrawn.
+Known limits include SQLite/single-process deployment, no HA or measured large-department capacity, no SSO/MFA or forgotten-password recovery, no antivirus/content-disarm pipeline, no laboratory/instrument connectors, no automatic email delivery, and no jurisdiction-certified retention/disposal policy. The database is not encrypted at rest by the application. Restricted-case membership needs careful administration because no emergency bypass is provided. Examiner reassignment is independently reviewed and does not silently grant restricted-case membership. Already exported copies are not automatically recalled when an opinion is withdrawn.
+
+The new disposal workflow records physical disposition; it does not erase electronic records, operate equipment, prescribe methods, determine lawful authority, or automatically recall old exports. Administrative certificates must not be used to hide clinical evidence from opinion review.
 
 The default PDF font covers the application's basic Latin output; configure a deployment-supplied font through `OV_PDF_FONT` for other scripts and validate rendering. Unsupported default-font characters fail explicitly rather than silently producing corrupted text. Fonts are not bundled. Labels currently print on A4 rather than thermal-printer templates.
 

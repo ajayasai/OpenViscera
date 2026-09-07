@@ -14,7 +14,7 @@ from fastapi.staticfiles import StaticFiles
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from .domain import (RuleError, blockers, dt, evidence_fingerprint, latest_report, now_iso,
-                     opinion_pending, require, report_withdrawal, opinion_withdrawal)
+                     opinion_pending, require, report_withdrawal, opinion_withdrawal, lifecycle_snapshot, disposed)
 from .documents import document
 from .evidence import export_bundle
 from .models import (CaseCreate, Command, LabCreate, Login, MODELS, Upload, UserCreate, UserStatus,
@@ -79,14 +79,14 @@ class RequestGuard:
 
 
 def queue_snapshot(states, actor):
-    queues = {name: [] for name in ["dispatch", "receipt", "reports", "review", "opinions", "exceptions", "followups"]}
+    queues = {name: [] for name in ["dispatch", "receipt", "reports", "review", "opinions", "exceptions", "followups", "lifecycle"]}
     now = dt(now_iso())
     for s in states:
         def add(name, label, **extra):
             queues[name].append({"case_id": s["id"], "case_ref": s["case_ref"], "priority": s["priority"],
                                  "label": label, **extra})
         for sp in s["specimens"]:
-            if not any(t["specimen_id"] == sp["id"] for t in s["transfers"]):
+            if not disposed(s, sp["id"]) and not sp.get("disposed_at") and not any(t["specimen_id"] == sp["id"] for t in s["transfers"]):
                 add("dispatch", sp["container_id"], specimen_id=sp["id"], sealed=bool(sp["seal_ref"]))
             if sp["quarantined"]:
                 add("exceptions", sp["container_id"] + ": unresolved discrepancy", specimen_id=sp["id"])
@@ -106,6 +106,25 @@ def queue_snapshot(states, actor):
                     add("followups", r["examination"], request_id=r["id"], due_at=followups[-1]["next_due_at"])
             elif not report["reviewed_at"]:
                 add("review", report["laboratory_reference"], report_id=report["id"], revision=report["revision"])
+        if actor["role"] != "lab":
+            life = lifecycle_snapshot(s, now.isoformat(), actor["id"])
+            for entry in life["specimens"]:
+                proposal = entry["proposal"]
+                if proposal:
+                    label = "Cancel stale disposal proposal" if entry["proposal_stale"] else (
+                        "Independent disposal review" if proposal["status"] == "pending" else "Approved disposal awaiting documentary completion")
+                    add("lifecycle", entry["container_id"] + ": " + label, specimen_id=entry["specimen_id"])
+                elif not entry["disposed"] and not entry["retention"] and not any(
+                        r["specimen_id"] == entry["specimen_id"] for r in life["pending_retentions"]):
+                    add("lifecycle", entry["container_id"] + ": retention instruction missing", specimen_id=entry["specimen_id"])
+                elif entry["retention_due"]:
+                    add("lifecycle", entry["container_id"] + ": retention review due", specimen_id=entry["specimen_id"],
+                        due_at=entry["retention"]["retain_until"], blockers=entry["blockers"])
+            for name, label in [("pending_retentions", "Retention instruction awaiting review"),
+                                ("pending_hold_releases", "Preservation hold release awaiting review"),
+                                ("pending_reassignments", "Examiner reassignment awaiting review")]:
+                for entry in life[name]:
+                    add("lifecycle", label, control_id=entry["id"])
         if actor["role"] != "lab" and opinion_pending(s):
             add("opinions", "Supplementary opinion pending" if any(o["issued_at"] for o in s["opinions"])
                 else "Final opinion pending", blockers=blockers(s))
@@ -127,7 +146,7 @@ def create_app(data_dir=None, origin=None, insecure_local=False):
     else:
         require(parsed.scheme == "https", "HTTPS origin required outside explicit loopback demo mode", 503)
     store = Store(data_dir)
-    app = FastAPI(title="OpenViscera", version="0.2.0", docs_url=None, redoc_url=None, openapi_url=None)
+    app = FastAPI(title="OpenViscera", version="0.3.0", docs_url=None, redoc_url=None, openapi_url=None)
     app.state.store = store
     app.add_middleware(RequestGuard, origin=origin, secure=not insecure_local)
     app.add_middleware(TrustedHostMiddleware, allowed_hosts=[parsed.hostname])
@@ -154,6 +173,7 @@ def create_app(data_dir=None, origin=None, insecure_local=False):
 
     def enriched(actor, s):
         return {"case": s,
+                "lifecycle": lifecycle_snapshot(s, actor_id=actor["id"]) if actor["role"] != "lab" else None,
                 "report_status": {r["id"]: ("withdrawn" if (report_withdrawal(s, r["id"]) or {}).get("status") == "approved"
                                              else "disputed" if report_withdrawal(s, r["id"]) else
                                              "superseded" if (latest_report(s, r["request_id"]) or {}).get("id") != r["id"]
@@ -167,7 +187,7 @@ def create_app(data_dir=None, origin=None, insecure_local=False):
 
     @app.get("/healthz")
     def health():
-        return {"status": "ok", "version": "0.2.0"}
+        return {"status": "ok", "version": "0.3.0"}
 
     @app.get("/")
     def index():
@@ -279,7 +299,7 @@ def create_app(data_dir=None, origin=None, insecure_local=False):
         require("/" not in data.filename and "\\" not in data.filename and not any(ord(x) < 32 for x in data.filename),
                 "Unsafe attachment filename", 422)
         values = {"specimen_id": data.specimen_id, "filename": data.filename, "media_type": data.media_type,
-                  "sha256": hashlib.sha256(content).hexdigest(), "size": len(content)}
+                  "sha256": hashlib.sha256(content).hexdigest(), "size": len(content), "purpose": data.purpose}
         return store.command(actor, case_id, "attach", values, data.expected_version, key(request), blob=content)
 
     @app.get("/api/cases/{case_id}/attachments/{attachment_id}")
