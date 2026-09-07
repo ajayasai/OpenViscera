@@ -42,4 +42,4 @@ Automated tests are evidence about implemented rules, not accreditation, legal c
 
 ## Version upgrades
 
-Database schema 2 has an explicit additive upgrade from schema 1. Stop the service, back up, retain an external checkpoint and follow [the v0.2 upgrade procedure](V02-UPGRADE.md). Migration verifies existing evidence and unchanged case heads; a frozen v1 reducer preserves old event interpretation. Test against a copy before deployment. Further migrations and key rotation are not implied by this one upgrade.
+Database schema 3 has an explicit additive upgrade from schema 1 or 2. Stop all old writers, back up, retain a separate external checkpoint, install v0.3, then follow [the v0.3 procedure](V03-UPGRADE.md). Migration verifies existing evidence and unchanged case heads; frozen v1/v2 reducers preserve old interpretation. Test against a restored copy before deployment. Do not downgrade or run mixed writers. This is not rolling migration or key rotation.

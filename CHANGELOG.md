@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.3.0 — 7 September 2026
+
+- Added independently reviewed specimen retention instructions and changes.
+- Added immediate specimen/case preservation holds and independently reviewed release.
+- Added proposal/approval/documentary completion for disposal, with current-evidence, retention, custody and hold gates checked transactionally at every transition.
+- Added conservative stale disposal fingerprints: intervening holds and rejected changes do not revive old approvals.
+- Added original administrative certificate attachments, distinct from clinical evidence; certificates cannot become laboratory reports.
+- Completed disposal closes physical actions without deleting original records; late reports still reopen opinion work.
+- Added independently approved examiner reassignment, restricted-case membership rechecks and pending-reassignment opinion gates.
+- Added a Lifecycle screen and eighth work queue; retained laboratory and restricted-case boundaries.
+- Froze the v0.2 reducer byte-for-byte and added explicit migration from schema 1 or 2 to schema 3 without rewriting signed history.
+- Extended API/domain/recovery/migration/concurrency tests and a real Chromium lifecycle/reassignment journey. See docs/VALIDATION.md for measured scope and limitations.
+
+
 ## 0.2.0 — 2026-09-06
 
 Added restricted-case membership, signed HTTP access auditing with fail-closed sensitive responses, independently reviewed corrections and report withdrawals, issued-opinion withdrawals, documented external returns, additional examination acceptance, previewed atomic dispatch batches, permission-checked specimen lookup, password changes with session revocation and throttling, and an explicit additive migration preserving frozen v1 event semantics.
