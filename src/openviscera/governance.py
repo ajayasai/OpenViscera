@@ -137,7 +137,12 @@ class GovernanceMixin:
             state = self.visible(actor, self._load(c, actor, row["case_id"]))
             specimen = next((sp for sp in state["specimens"] if sp["id"] == row["specimen_id"]), None)
             require(specimen is not None, "Specimen not found", 404)
-            return {"case_id": state["id"], "case_ref": state["case_ref"], "specimen": specimen, "version": state["version"]}
+            from .domain import lifecycle_snapshot
+            lifecycle = None if actor["role"] == "lab" else next(
+                x for x in lifecycle_snapshot(state, actor_id=actor["id"])["specimens"]
+                if x["specimen_id"] == specimen["id"])
+            return {"case_id": state["id"], "case_ref": state["case_ref"], "specimen": specimen,
+                    "lifecycle": lifecycle, "version": state["version"]}
 
 
 class AccessAuditMiddleware:

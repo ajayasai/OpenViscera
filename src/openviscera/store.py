@@ -16,7 +16,7 @@ from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from pydantic import ValidationError
 
-from .domain import (RuleError, apply, canonical, digest, item, normalized, now_iso, require, may_access)
+from .domain import (RuleError, apply, canonical, digest, item, normalized, now_iso, require, may_access, record, disposed)
 from .models import CaseCreate, MODELS, ROLES, UserCreate, LabCreate
 from .governance import GovernanceMixin, AUDIT_SCHEMA
 
@@ -83,7 +83,7 @@ def verify_events(events, public_key, state=None, replay=False):
     require(bool(events), "Empty evidence ledger")
     for seq, event in enumerate(events, 1):
         body = event["body"]
-        require(body["schema"] in {1, 2} and body["schema"] >= last_schema and body["seq"] == seq and body["previous_hash"] == previous,
+        require(body["schema"] in {1, 2, 3} and body["schema"] >= last_schema and body["seq"] == seq and body["previous_hash"] == previous,
                 "Evidence ledger sequence/chain mismatch")
         require(event["hash"] == digest(body), "Evidence event hash mismatch")
         try:
@@ -117,7 +117,7 @@ class Store(GovernanceMixin):
         self.public_key = self.key.public_key()
         with self.transaction(False) as c:
             meta = dict(c.execute("SELECT name,value FROM meta"))
-            require(meta.get("schema") == "2" or (allow_legacy and meta.get("schema") == "1"),
+            require(meta.get("schema") == "3" or (allow_legacy and meta.get("schema") in {"1", "2"}),
                     "Database upgrade required: stop the service, back up, then run openviscera migrate", 503)
             require(meta.get("public_key") == self.public_b64, "Signing key does not match this database", 503)
         self.dummy_password = password_hash(secrets.token_urlsafe(24))
@@ -145,7 +145,7 @@ class Store(GovernanceMixin):
             c.executescript(SCHEMA)
             for statement in AUDIT_SCHEMA:
                 c.execute(statement)
-            c.executemany("INSERT INTO meta VALUES (?,?)", [("schema", "2"), ("public_key", public)])
+            c.executemany("INSERT INTO meta VALUES (?,?)", [("schema", "3"), ("public_key", public)])
         os.chmod(path / "openviscera.sqlite3", 0o600)
         return cls(path)
 
@@ -308,7 +308,8 @@ class Store(GovernanceMixin):
         s["requests"] = [r for r in s["requests"] if r["lab_id"] == actor["lab_id"]]
         specimens = {r["specimen_id"] for r in s["requests"]}
         requests = {r["id"] for r in s["requests"]}
-        s["specimens"] = [x for x in s["specimens"] if x["id"] in specimens]
+        s["specimens"] = [{**x, "disposed_at": (disposed(state, x["id"]) or {}).get("executed_at")}
+                          for x in s["specimens"] if x["id"] in specimens]
         s["transfers"] = [t for t in s["transfers"] if t["specimen_id"] in specimens and
                           (t["sender_id"] == actor["id"] or t["recipient_id"] == actor["id"])]
         s["reports"] = [r for r in s["reports"] if r["request_id"] in requests]
@@ -354,7 +355,7 @@ class Store(GovernanceMixin):
         eid, recorded = uuid.uuid4().hex, now_iso()
         state = apply(old, action, data, actor, recorded, eid, case_id)
         last = c.execute("SELECT hash FROM events WHERE case_id=? ORDER BY seq DESC LIMIT 1", (case_id,)).fetchone()
-        body = {"schema": 2, "case_id": case_id, "seq": state["version"], "event_id": eid, "actor": actor,
+        body = {"schema": 3, "case_id": case_id, "seq": state["version"], "event_id": eid, "actor": actor,
                 "recorded_at": recorded, "action": action, "data": data,
                 "previous_hash": last["hash"] if last else "0" * 64, "after_digest": digest(state)}
         c.execute("INSERT INTO events VALUES (?,?,?,?,?)", (case_id, state["version"], canonical(body).decode(),
@@ -419,7 +420,7 @@ class Store(GovernanceMixin):
             return self._remember(c, actor, key, payload, state, eid)
 
     def _authorize_command(self, c, actor, s, action, data):
-        if actor["role"] == "examiner" and action in {"collect", "request", "review", "draft", "issue", "correct", "withdraw_report", "withdraw_opinion", "access_policy"}:
+        if actor["role"] == "examiner" and action in {"collect", "request", "review", "draft", "issue", "correct", "withdraw_report", "withdraw_opinion", "access_policy", "propose_reassignment", "propose_retention"}:
             require(s["examiner_id"] == actor["id"], "Only the assigned examiner may perform this action", 403)
         if action == "request" or (action == "handover" and data["recipient_lab_id"]):
             lab_id = data.get("lab_id") or data["recipient_lab_id"]
@@ -455,6 +456,32 @@ class Store(GovernanceMixin):
             require(item(s, "requests", data["request_id"])["lab_id"] == actor["lab_id"], "Request belongs to another laboratory", 403)
             if data["attachment_id"]:
                 item(self.visible(actor, s), "attachments", data["attachment_id"])
+
+        if action == "attach" and data.get("purpose") == "administrative":
+            require(actor["role"] != "lab", "Administrative certificates are restricted to department staff", 403)
+        if action == "propose_reassignment" or (action == "decide_reassignment" and data["decision"] == "approve"):
+            uid = data["new_examiner_id"] if action == "propose_reassignment" else record(s, "reassignments", data["reassignment_id"])["new_examiner_id"]
+            user = self._user(c, uid)
+            require(user["active"] and user["org_id"] == actor["org_id"] and user["role"] == "examiner",
+                    "Select an active department examiner", 422)
+            require(may_access(user_public(user), s), "Replacement examiner needs explicit case access first", 422)
+        if action in {"propose_disposal", "decide_disposal", "record_disposal"}:
+            if action == "propose_disposal":
+                sid = data["specimen_id"]
+            else:
+                sid = record(s, "disposals", data["disposal_id"])["specimen_id"]
+            if action != "decide_disposal" or data["decision"] == "approve":
+                holder = item(s, "specimens", sid)["holder_id"]
+                if not holder.startswith("external:"):
+                    user = self._user(c, holder)
+                    require(user["active"] and user["role"] in {"examiner", "coordinator"} and may_access(user_public(user), s),
+                            "Disposal requires an active department custodian with case access", 422)
+        if action == "record_disposal":
+            proposal = record(s, "disposals", data["disposal_id"])
+            require(proposal["status"] == "approved", "Disposal requires independent approval")
+            approver = self._user(c, proposal["decided_by"])
+            require(approver["active"] and approver["role"] == "reviewer" and may_access(user_public(approver), s),
+                    "Disposal approver no longer has active reviewer access; cancel and seek new approval", 422)
 
     def attachment(self, actor, case_id, attachment_id):
         with self.transaction(False) as c:

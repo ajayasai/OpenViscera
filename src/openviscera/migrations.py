@@ -10,13 +10,14 @@ def migrate(data_dir):
     before = check_database(store)
     with store.transaction() as c:
         version = c.execute("SELECT value FROM meta WHERE name='schema'").fetchone()[0]
-        require(version in {"1", "2"}, "Unsupported migration source")
+        require(version in {"1", "2", "3"}, "Unsupported migration source")
         if version == "1":
             for statement in AUDIT_SCHEMA:
                 c.execute(statement)
-            c.execute("UPDATE meta SET value='2' WHERE name='schema'")
-            store._admin_event(c, "local-migration", "schema_migrated", {"from": 1, "to": 2})
+        if version != "3":
+            c.execute("UPDATE meta SET value='3' WHERE name='schema'")
+            store._admin_event(c, "local-migration", "schema_migrated", {"from": int(version), "to": 3})
     result = Store(data_dir)
     after = check_database(result)
     require(before["heads"] == after["heads"], "Migration changed case ledger heads")
-    return {"schema": 2, "changed": version == "1", "cases_verified": len(after["heads"]), "heads": after["heads"]}
+    return {"schema": 3, "changed": version != "3", "cases_verified": len(after["heads"]), "heads": after["heads"]}
