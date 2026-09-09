@@ -408,7 +408,7 @@ def test_v2_migration_preserves_signatures_issued_records_and_old_bundle(env, mo
     with pytest.raises(RuleError, match="upgrade required"):
         Store(store.path)
     result = migrate(store.path)
-    assert result["schema"] == 3 and result["changed"]
+    assert result["schema"] == 4 and result["changed"]
     assert canonical(store.get_case(users["examiner"], s["id"])) == old_state
     assert store.evidence(users["examiner"], s["id"])[1] == old_events
     assert verify_bundle(bundle, store.public_b64)["valid"]

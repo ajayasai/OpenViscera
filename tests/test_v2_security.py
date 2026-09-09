@@ -217,7 +217,7 @@ def test_migration_preserves_v1_signatures_bundle_and_issued_record(env, monkeyp
     with pytest.raises(RuleError, match="upgrade required"):
         Store(store.path)
     result = migrate(store.path)
-    assert result["schema"] == 3 and result["changed"]
+    assert result["schema"] == 4 and result["changed"]
     upgraded = Store(store.path)
     assert canonical(upgraded.get_case(users["examiner"], s["id"])) == before
     assert upgraded.evidence(users["examiner"], s["id"])[1] == old_events

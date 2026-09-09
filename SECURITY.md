@@ -24,10 +24,27 @@ Someone with the signing key can create apparently valid records. Keep the key a
 
 Use TLS, encrypted host volumes, least-privilege operating-system accounts, network restrictions, protected backup storage and reviewed retention policies. The application database and signing key are not application-encrypted at rest; encrypted backups do not change that fact. File format signatures and hashes are not malware detection. Uploaded PDFs may contain active or malicious content: deploy a reviewed scanning/quarantine process and hardened viewers before real-data use.
 
-There is no SSO, MFA, forgotten-password recovery, independent key custody, formal key-rotation migration, operating-system-wide read monitoring, antivirus/CDR service, export approval workflow or high-availability design. v0.2 provides restricted-case named membership, current-password-verified password changes and per-department HTTP access auditing. An administrator cannot automatically read restricted clinical contents; administrators/auditors can inspect department-wide audit metadata including opaque case IDs. The contact directory remains department scoped. There is no emergency restricted-case bypass. v0.3 adds independently reviewed examiner reassignment and administrative preservation/disposal controls; applicable legal authority remains external. Case exports contain confidential information; human recipients remain responsible for secure handling.
+There is no SSO, WebAuthn/passkey authentication, automated identity-proofing recovery, independent key custody, formal key-rotation migration, operating-system-wide read monitoring, antivirus/CDR service, export approval workflow or high-availability design. v0.2 provides restricted-case named membership, current-password-verified password changes and per-department HTTP access auditing. An administrator cannot automatically read restricted clinical contents; administrators/auditors can inspect department-wide audit metadata including opaque case IDs. The contact directory remains department scoped. There is no emergency restricted-case bypass. v0.3 adds independently reviewed examiner reassignment and administrative preservation/disposal controls; applicable legal authority remains external. Case exports contain confidential information; human recipients remain responsible for secure handling.
 
 The default setup is single-process SQLite. Resource bounds apply to individual uploads/requests/exports, not total concurrent resource consumption. Add reverse-proxy connection, rate and resource limits. Do not trust arbitrary forwarded headers: the CLI disables proxy-header processing. Cookies are secure except in explicit loopback-only local evaluation mode.
 
 ## v0.3 lifecycle trust boundaries
 
 Preservation, retention and disposal controls are administrative safeguards, not legal authorization or physical-event verification. A certificate's administrative classification is human-entered: do not put clinical evidence there to bypass opinion-staleness detection. Independent approval, current case versions, access checks and conservative disposal fingerprints are enforced on the server. Signed history is retained after physical disposal. Review [v0.3 operating boundaries](docs/V03-UPGRADE.md), including immutable completion, no witness countersignature, continued need for host-level encryption, and no automatic recall of old exports.
+
+
+## v0.4 authentication trust boundaries
+
+Authenticator enrollment, replay rejection, single-use recovery codes, signed
+session metadata and optional mandatory MFA are implemented. Sensitive factor or
+password changes require fresh credentials and revoke sessions/challenges. Local
+operator recovery is explicitly audited and requires a subsequent personal
+password change before case access; no web administrator reset endpoint exists.
+
+TOTP is not phishing-resistant. MFA-secret AES-GCM encryption uses a purpose-derived
+server key, not independently held hardware keys; database encryption is still an
+operator responsibility. A server/key compromise defeats application signatures.
+Restore clears recovery-code hashes and temporarily bars the current TOTP window,
+but restores password/factor configuration from the snapshot: rotate credentials
+and regenerate codes after recovery. Old snapshots require external checkpoints to
+detect rollback. Read [complete operating boundaries](docs/V04-SECURITY.md).

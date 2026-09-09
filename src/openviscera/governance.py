@@ -70,30 +70,6 @@ class GovernanceMixin:
                 "head": head, "public_key": self.public_b64,
                 "previous_hash": events[offset - 1]["hash"] if 0 < offset <= len(events) else "0" * 64}
 
-    def change_password(self, actor, current_password, new_password):
-        from .store import password_hash, password_matches
-        require(14 <= len(new_password) <= 1024 and current_password != new_password,
-                "Choose a different password between 14 and 1024 characters", 422)
-        import time
-        now = int(time.time())
-        bucket = "password-change:" + actor["id"]
-        failed = False
-        with self.transaction() as c:
-            row = self._user(c, actor["id"])
-            require(row["active"] and row["org_id"] == actor["org_id"], "Account is unavailable", 403)
-            count = c.execute("SELECT COUNT(*) FROM attempts WHERE bucket=? AND at>=?", (bucket, now - 900)).fetchone()[0]
-            require(count < 8, "Too many failed password changes; retry after 15 minutes", 429)
-            if not password_matches(current_password, row["password"]):
-                c.execute("INSERT INTO attempts VALUES (?,?)", (bucket, now))
-                failed = True
-            else:
-                c.execute("UPDATE users SET password=? WHERE id=?", (password_hash(new_password), actor["id"]))
-                self._seal_identity(c, "user", actor["id"], c.execute("SELECT * FROM users WHERE id=?", (actor["id"],)).fetchone())
-                c.execute("DELETE FROM sessions WHERE user_id=?", (actor["id"],))
-                c.execute("DELETE FROM attempts WHERE bucket=?", (bucket,))
-                self._admin_event(c, actor["id"], "password_changed", {"user_id": actor["id"], "sessions_revoked": True})
-        require(not failed, "Current password is incorrect", 403)
-
     def batch_handover(self, actor, case_id, data, key):
         from .models import BatchHandover, ROLES
         from .store import validate

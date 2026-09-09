@@ -2,9 +2,26 @@
 
 **Every specimen. Every next step.** A self-hosted forensic-medicine department workbench for specimen dispatch, custody reconciliation, external laboratory reports, and pending final or supplementary opinions.
 
-**Status: v0.3.0 — tested retention, preservation and reassignment upgrade; not a clinically validated production system.** Human experts enter preservative details, review results, and write opinions. OpenViscera does not interpret laboratory findings, recommend preservatives, infer causes of death, or generate medical conclusions.
+**Status: v0.4.0 — tested MFA and account-recovery upgrade; not an independently security-audited or clinically validated production system.** Human experts enter preservative details, review results, and write opinions. OpenViscera does not interpret laboratory findings, recommend preservatives, infer causes of death, or generate medical conclusions.
 
-## New in v0.3
+## New in v0.4
+
+| Improvement | Implemented behavior |
+| --- | --- |
+| Authenticator MFA | Password-verified setup, local QR/manual enrollment, RFC 6238 TOTP, expiring password-first challenges and persisted replay rejection. No case session before the second factor. |
+| Mandatory enrollment | `OV_REQUIRE_MFA=1` blocks case reads, counts, exports and writes until enrollment is complete, including administrator and laboratory accounts. |
+| One-use recovery codes | Ten random 128-bit codes, hashed at rest and shown once. Regeneration requires a fresh factor and revokes sessions. |
+| Account security screen | View session creation/expiry/authentication method, revoke a single session or all other sessions; manage MFA and password changes. |
+| Audited local recovery | No remote administrator MFA bypass. A trusted operator records a reason, sets a temporary password and explicitly opts into factor reset when necessary. Personal password change is required before case access. |
+| Safer restore | Sessions, challenges and pending enrollment are invalidated. Recovery codes are cleared to prevent replay from older snapshots; MFA secrets remain enrolled. |
+| Explicit migration | Database schema 4 adds signed security metadata. Case event schema stays 3; historical specimen records, case heads and signatures are not rewritten. |
+
+TOTP is not phishing-resistant passkey authentication. MFA-secret encryption does
+not encrypt the case database or protect against server private-key compromise.
+Read [setup, upgrade and recovery procedures](docs/V04-SECURITY.md) and
+[measured validation](docs/VALIDATION.md) before deployment.
+
+## Retained v0.3 workflow
 
 OpenViscera now follows the physical specimen beyond the laboratory return, with explicit retention instructions, preservation holds and independently reviewed disposal records. Expiry is a review task, never an automatic destruction trigger.
 
@@ -99,7 +116,7 @@ openviscera backup --data ./var --output /secure-location/department.ovb
 openviscera restore /secure-location/department.ovb --data ./restored-data
 ```
 
-Backup passphrases are prompted, not accepted as command-line arguments. Backups include the consistent database and signing key, use authenticated encryption, and must be protected. Restore refuses an existing destination, verifies the restored evidence, and invalidates sessions. Test recovery; do not merely test backup creation. This pilot bounds evidence bundles and backups to 100 MiB.
+Backup passphrases are prompted, not accepted as command-line arguments. Backups include the consistent database and signing key, use authenticated encryption, and must be protected. Restore refuses an existing destination, verifies the restored evidence, and invalidates sessions, challenges and recovery codes. Enrolled users must wait up to 90 seconds, sign in with their authenticator, then regenerate recovery codes; exceptional recovery uses the local CLI. Test recovery; do not merely test backup creation. This pilot bounds evidence bundles and backups to 100 MiB.
 
 ## Honest competitive scope
 
@@ -111,7 +128,7 @@ OpenViscera's implemented focus is the department-side gap around external labor
 
 [Workflow and permissions](docs/WORKFLOW.md) · [Architecture](docs/ARCHITECTURE.md) · [Deployment and recovery](docs/OPERATIONS.md) · [Validation](docs/VALIDATION.md) · [Security policy](SECURITY.md) · [Contributing](CONTRIBUTING.md)
 
-Known limits include SQLite/single-process deployment, no HA or measured large-department capacity, no SSO/MFA or forgotten-password recovery, no antivirus/content-disarm pipeline, no laboratory/instrument connectors, no automatic email delivery, and no jurisdiction-certified retention/disposal policy. The database is not encrypted at rest by the application. Restricted-case membership needs careful administration because no emergency bypass is provided. Examiner reassignment is independently reviewed and does not silently grant restricted-case membership. Already exported copies are not automatically recalled when an opinion is withdrawn.
+Known limits include SQLite/single-process deployment, no HA or measured large-department capacity, no SSO/WebAuthn or independently operated identity recovery, no antivirus/content-disarm pipeline, no laboratory/instrument connectors, no automatic email delivery, and no jurisdiction-certified retention/disposal policy. The database is not encrypted at rest by the application. Restricted-case membership needs careful administration because no emergency bypass is provided. Examiner reassignment is independently reviewed and does not silently grant restricted-case membership. Already exported copies are not automatically recalled when an opinion is withdrawn.
 
 The new disposal workflow records physical disposition; it does not erase electronic records, operate equipment, prescribe methods, determine lawful authority, or automatically recall old exports. Administrative certificates must not be used to hide clinical evidence from opinion review.
 

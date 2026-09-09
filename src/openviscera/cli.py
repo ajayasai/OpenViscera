@@ -19,7 +19,7 @@ def main(argv=None):
     init.add_argument("--data", default="./var")
     init.add_argument("--admin", default="admin")
     init.add_argument("--department", default="department")
-    migrate_parser = sub.add_parser("migrate", help="Explicitly upgrade an existing v1 store; stop the server and back up first")
+    migrate_parser = sub.add_parser("migrate", help="Explicitly upgrade an existing store; stop the server and back up first")
     migrate_parser.add_argument("--data", default="./var")
     demo = sub.add_parser("demo", help="Create synthetic cases with randomly generated demo credentials")
     demo.add_argument("--data", default="./demo-data")
@@ -42,6 +42,10 @@ def main(argv=None):
     restore = sub.add_parser("restore", help="Verify and restore an encrypted backup into a new directory")
     restore.add_argument("backup")
     restore.add_argument("--data", required=True)
+    recovery = sub.add_parser("recover-account", help="Trusted local credential recovery; revokes sessions and requires password change")
+    recovery.add_argument("username")
+    recovery.add_argument("--data", default="./var")
+    recovery.add_argument("--reset-mfa", action="store_true", help="Explicitly remove a lost factor after out-of-band identity checks")
     args = parser.parse_args(argv)
     try:
         if args.command == "init":
@@ -53,6 +57,13 @@ def main(argv=None):
                                             "role": "admin", "password": password})
             print("Initialized. Create examiner, reviewer and coordinator accounts from the Administration screen.")
             print("Store public-key.txt separately; protect signing.key and the entire data directory.")
+        elif args.command == "recover-account":
+            store = Store(args.data)
+            reason = input("Verified identity / recovery authorization reference (10+ characters): ")
+            password = getpass.getpass("Temporary recovery password (14+ characters): ")
+            require(password == getpass.getpass("Confirm temporary password: "), "Passwords differ", 422)
+            store.recover_account(args.username, password, reason, args.reset_mfa)
+            print("Recovery recorded. Sessions revoked; personal password change required before case access.")
         elif args.command == "migrate":
             from .migrations import migrate
             print(json.dumps(migrate(args.data), indent=2))

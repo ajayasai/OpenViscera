@@ -68,6 +68,7 @@ def test_browser_complete_workflow_and_revision(env, tmp_path):
                 shell = shell.replace('<script src="/static/app.js" defer></script>', '')
                 shell = shell.replace('<script src="/static/controls.js" defer></script>', '')
                 shell = shell.replace('<script src="/static/lifecycle.js" defer></script>', '')
+                shell = shell.replace('<script src="/static/security.js" defer></script>', '')
                 shell = shell.replace('<link rel="stylesheet" href="/static/style.css">', '')
                 page.set_content(shell)
                 page.add_style_tag(content=(static / "style.css").read_text())
@@ -84,6 +85,7 @@ def test_browser_complete_workflow_and_revision(env, tmp_path):
                 page.add_script_tag(content=(static / "app.js").read_text())
                 page.add_script_tag(content=(static / "controls.js").read_text())
                 page.add_script_tag(content=(static / "lifecycle.js").read_text())
+                page.add_script_tag(content=(static / "security.js").read_text())
             else:
                 page.goto(url)
 
@@ -280,6 +282,7 @@ def test_browser_complete_workflow_and_revision(env, tmp_path):
             save("Find specimen")
             page.get_by_role("heading", name="BROWSER-BATCH", exact=True).wait_for()
             page.get_by_role("button", name="Account", exact=True).click()
+            page.get_by_role("button", name="Change password", exact=True).click()
             fill("current_password", "synthetic-test-password-123")
             fill("new_password", "browser-changed-password-123")
             save("Change password and sign out")
