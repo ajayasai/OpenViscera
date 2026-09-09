@@ -3,6 +3,7 @@ services:
     build: .
     environment:
       OV_DATA: /data
+      OV_REQUIRE_MFA: ${OV_REQUIRE_MFA:-0}
       OV_ORIGIN: ${OV_ORIGIN:-https://localhost}
     ports:
       - "127.0.0.1:8000:8000"

@@ -18,9 +18,10 @@ from .domain import (RuleError, blockers, dt, evidence_fingerprint, latest_repor
 from .documents import document
 from .evidence import export_bundle
 from .models import (CaseCreate, Command, LabCreate, Login, MODELS, Upload, UserCreate, UserStatus,
-                     BatchHandover, ChangePassword)
+                     BatchHandover)
 from .store import Store
 from .governance import AccessAuditMiddleware
+from .auth_routes import PasswordChange, install_auth_routes, login_response
 
 MAX_REQUEST = 8 * 1024 * 1024
 STATIC = Path(__file__).parent / "static"
@@ -134,7 +135,11 @@ def queue_snapshot(states, actor):
             "queues": {k: v[:200] for k, v in queues.items()}, "queue_limit": 200, "generated_at": now_iso()}
 
 
-def create_app(data_dir=None, origin=None, insecure_local=False):
+def create_app(data_dir=None, origin=None, insecure_local=False, require_mfa=None):
+    if require_mfa is None:
+        value = os.environ.get("OV_REQUIRE_MFA", "0")
+        require(value in {"0", "1"}, "OV_REQUIRE_MFA must be 0 or 1", 503)
+        require_mfa = value == "1"
     data_dir = data_dir or os.environ.get("OV_DATA", "./var")
     origin = (origin or os.environ.get("OV_ORIGIN", "https://localhost")).rstrip("/")
     parsed = urlsplit(origin)
@@ -146,7 +151,7 @@ def create_app(data_dir=None, origin=None, insecure_local=False):
     else:
         require(parsed.scheme == "https", "HTTPS origin required outside explicit loopback demo mode", 503)
     store = Store(data_dir)
-    app = FastAPI(title="OpenViscera", version="0.3.0", docs_url=None, redoc_url=None, openapi_url=None)
+    app = FastAPI(title="OpenViscera", version="0.4.0", docs_url=None, redoc_url=None, openapi_url=None)
     app.state.store = store
     app.add_middleware(RequestGuard, origin=origin, secure=not insecure_local)
     app.add_middleware(TrustedHostMiddleware, allowed_hosts=[parsed.hostname])
@@ -166,7 +171,15 @@ def create_app(data_dir=None, origin=None, insecure_local=False):
         request.state.actor = actor
         if request.method not in {"GET", "HEAD", "OPTIONS"}:
             require(hmac.compare_digest(request.headers.get("X-CSRF-Token", ""), csrf), "Invalid CSRF token", 403)
+        requirements = store.account_requirements(actor, require_mfa)
+        allowed_paths = {"/api/me", "/api/logout", "/api/account/security", "/api/account/password"}
+        if not requirements["password_change_required"]:
+            allowed_paths |= {"/api/account/mfa/setup", "/api/account/mfa/confirm", "/api/account/sessions/revoke"}
+        require(not any(requirements.values()) or request.url.path in allowed_paths,
+                "Complete the required password change or MFA enrollment before accessing case data", 403)
         return actor
+
+    install_auth_routes(app, store, auth, not insecure_local, require_mfa)
 
     def key(request):
         return request.headers.get("Idempotency-Key", "")
@@ -187,7 +200,7 @@ def create_app(data_dir=None, origin=None, insecure_local=False):
 
     @app.get("/healthz")
     def health():
-        return {"status": "ok", "version": "0.3.0"}
+        return {"status": "ok", "version": "0.4.0"}
 
     @app.get("/")
     def index():
@@ -195,12 +208,8 @@ def create_app(data_dir=None, origin=None, insecure_local=False):
 
     @app.post("/api/login")
     def login(data: Login, request: Request):
-        token, csrf, actor = store.login(data.username, data.password, request.client.host if request.client else "unknown")
-        request.state.actor = actor
-        response = JSONResponse({"user": actor, "csrf": csrf})
-        response.set_cookie("ov_session", token, httponly=True, secure=not insecure_local,
-                            samesite="strict", max_age=8 * 3600, path="/")
-        return response
+        result = store.login(data.username, data.password, request.client.host if request.client else "unknown")
+        return login_response(result, request, store, not insecure_local, require_mfa)
 
     @app.post("/api/logout")
     def logout(request: Request, actor=Depends(auth)):
@@ -212,7 +221,8 @@ def create_app(data_dir=None, origin=None, insecure_local=False):
     @app.get("/api/me")
     def me(request: Request, actor=Depends(auth)):
         _, csrf = store.session(request.cookies["ov_session"])
-        return {"user": actor, "csrf": csrf, "public_key": store.public_b64}
+        return {"user": actor, "csrf": csrf, "public_key": store.public_b64,
+                "security": store.account_requirements(actor, require_mfa)}
 
     @app.get("/api/catalog")
     def catalog(actor=Depends(auth)):
@@ -251,8 +261,8 @@ def create_app(data_dir=None, origin=None, insecure_local=False):
         return result
 
     @app.post("/api/account/password")
-    def change_password(data: ChangePassword, request: Request, actor=Depends(auth)):
-        store.change_password(actor, data.current_password, data.new_password)
+    def change_password(data: PasswordChange, request: Request, actor=Depends(auth)):
+        store.change_password(actor, data.current_password, data.new_password, data.code)
         response = JSONResponse({"ok": True, "reauthentication_required": True})
         response.delete_cookie("ov_session", path="/", secure=not insecure_local, httponly=True, samesite="strict")
         return response

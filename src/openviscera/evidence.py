@@ -7,6 +7,7 @@ import os
 import secrets
 import sqlite3
 import tempfile
+import time
 import zipfile
 from pathlib import Path
 from contextlib import closing
@@ -100,6 +101,13 @@ def check_database(store):
         for table, kind, identifier in [("users", "user", "id"), ("labs", "lab", "id"), ("sessions", "session", "hash")]:
             for row in c.execute("SELECT * FROM " + table):
                 store._check_identity(c, kind, row[identifier], row)
+        if c.execute("SELECT value FROM meta WHERE name='schema'").fetchone()[0] == "4":
+            sessions = {r[0] for r in c.execute("SELECT hash FROM sessions")}
+            contexts = {r[0] for r in c.execute("SELECT hash FROM session_context")}
+            require(sessions == contexts, "Session security metadata mismatch")
+            for table, kind in [("session_context", "session_context"), ("login_challenges", "challenge")]:
+                for record in c.execute("SELECT * FROM " + table):
+                    store._check_identity(c, kind, record["hash"], record)
         access_heads = {}
         if c.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='access_events'").fetchone():
             for org_row in c.execute("SELECT DISTINCT org_id FROM access_events"):
@@ -164,6 +172,17 @@ def restore_backup(content, password, destination):
         # Sessions are intentionally invalidated on restore.
         with restored.transaction() as c:
             c.execute("DELETE FROM sessions")
+            if c.execute("SELECT 1 FROM sqlite_master WHERE name='login_challenges'").fetchone():
+                c.execute("DELETE FROM login_challenges")
+            if "security" in {r[1] for r in c.execute("PRAGMA table_info(users)")}:
+                for user in c.execute("SELECT * FROM users").fetchall():
+                    state = json.loads(user["security"])
+                    state.pop("pending", None)
+                    if state.get("enabled"):
+                        # Do not resurrect recovery codes consumed after this snapshot.
+                        state["recovery_hashes"] = []
+                        state["last_counter"] = max(state.get("last_counter", -1), int(time.time()) // 30 + 1)
+                    restored._save_security(c, user["id"], state)
         (stage / "public-key.txt").write_text(restored.public_b64 + "\n")
         require(not target.exists(), "Restore target appeared during validation")
         stage.rename(target)

@@ -19,12 +19,13 @@ from pydantic import ValidationError
 from .domain import (RuleError, apply, canonical, digest, item, normalized, now_iso, require, may_access, record, disposed)
 from .models import CaseCreate, MODELS, ROLES, UserCreate, LabCreate
 from .governance import GovernanceMixin, AUDIT_SCHEMA
+from .authentication import AuthenticationMixin, AUTH_SCHEMA
 
 SCHEMA = """
 PRAGMA journal_mode=WAL;
 CREATE TABLE meta (name TEXT PRIMARY KEY, value TEXT NOT NULL);
 CREATE TABLE users (id TEXT PRIMARY KEY, org_id TEXT NOT NULL, username TEXT UNIQUE COLLATE NOCASE,
- display_name TEXT NOT NULL, role TEXT NOT NULL, lab_id TEXT, password TEXT NOT NULL, active INTEGER NOT NULL DEFAULT 1);
+ display_name TEXT NOT NULL, role TEXT NOT NULL, lab_id TEXT, password TEXT NOT NULL, active INTEGER NOT NULL DEFAULT 1, security TEXT NOT NULL DEFAULT '{}');
 CREATE TABLE labs (id TEXT PRIMARY KEY, org_id TEXT NOT NULL, name TEXT NOT NULL, name_norm TEXT NOT NULL,
  turnaround_days INTEGER NOT NULL, UNIQUE(org_id,name_norm));
 CREATE TABLE cases (id TEXT PRIMARY KEY, org_id TEXT NOT NULL, ref_norm TEXT NOT NULL,
@@ -107,7 +108,7 @@ def verify_events(events, public_key, state=None, replay=False):
     return previous
 
 
-class Store(GovernanceMixin):
+class Store(AuthenticationMixin, GovernanceMixin):
     def __init__(self, data_dir, allow_legacy=False):
         self.path = Path(data_dir)
         self.db = self.path / "openviscera.sqlite3"
@@ -117,7 +118,7 @@ class Store(GovernanceMixin):
         self.public_key = self.key.public_key()
         with self.transaction(False) as c:
             meta = dict(c.execute("SELECT name,value FROM meta"))
-            require(meta.get("schema") == "3" or (allow_legacy and meta.get("schema") in {"1", "2"}),
+            require(meta.get("schema") == "4" or (allow_legacy and meta.get("schema") in {"1", "2", "3"}),
                     "Database upgrade required: stop the service, back up, then run openviscera migrate", 503)
             require(meta.get("public_key") == self.public_b64, "Signing key does not match this database", 503)
         self.dummy_password = password_hash(secrets.token_urlsafe(24))
@@ -143,9 +144,9 @@ class Store(GovernanceMixin):
         (path / "public-key.txt").write_text(public + "\n")
         with closing(sqlite3.connect(path / "openviscera.sqlite3")) as c, c:
             c.executescript(SCHEMA)
-            for statement in AUDIT_SCHEMA:
+            for statement in [*AUDIT_SCHEMA, *AUTH_SCHEMA]:
                 c.execute(statement)
-            c.executemany("INSERT INTO meta VALUES (?,?)", [("schema", "3"), ("public_key", public)])
+            c.executemany("INSERT INTO meta VALUES (?,?)", [("schema", "4"), ("public_key", public)])
         os.chmod(path / "openviscera.sqlite3", 0o600)
         return cls(path)
 
@@ -217,7 +218,7 @@ class Store(GovernanceMixin):
             require((v["role"] == "lab") == bool(v["lab_id"]), "Laboratory identity is required only for lab users", 422)
             if v["lab_id"]:
                 self._lab(c, v["lab_id"], org_id)
-            c.execute("INSERT INTO users VALUES (?,?,?,?,?,?,?,1)",
+            c.execute("INSERT INTO users(id,org_id,username,display_name,role,lab_id,password,active) VALUES (?,?,?,?,?,?,?,1)",
                       (uid, org_id, v["username"], v["display_name"], v["role"], v["lab_id"], hashed))
             record = c.execute("SELECT * FROM users WHERE id=?", (uid,)).fetchone()
             self._seal_identity(c, "user", uid, record)
@@ -233,37 +234,11 @@ class Store(GovernanceMixin):
             self._user(c, uid)
             c.execute("UPDATE users SET active=? WHERE id=?", (int(active), uid))
             self._seal_identity(c, "user", uid, c.execute("SELECT * FROM users WHERE id=?", (uid,)).fetchone())
-            c.execute("DELETE FROM sessions WHERE user_id=?", (uid,))
+            self._invalidate_auth(c, uid)
             self._admin_event(c, actor["id"], "user_status_changed", {"id": uid, "active": active})
 
     def login(self, username, password, ip):
-        now = int(time.time())
-        buckets = ["ip:" + ip, "user:" + normalized(username)]
-        with self.transaction() as c:
-            c.execute("DELETE FROM attempts WHERE at<?", (now - 900,))
-            for bucket, maximum in zip(buckets, [30, 8]):
-                count = c.execute("SELECT COUNT(*) FROM attempts WHERE bucket=?", (bucket,)).fetchone()[0]
-                require(count < maximum, "Too many failed logins; retry after the 15-minute window", 429)
-            row = c.execute("SELECT * FROM users WHERE username=?", (username,)).fetchone()
-            if row:
-                self._check_identity(c, "user", row["id"], row)
-            good = password_matches(password, row["password"] if row else self.dummy_password)
-            if not row or not row["active"] or not good:
-                c.executemany("INSERT INTO attempts VALUES (?,?)", [(b, now) for b in buckets])
-                failed = True
-            else:
-                failed = False
-                token, csrf = secrets.token_urlsafe(32), secrets.token_urlsafe(32)
-                c.execute("DELETE FROM sessions WHERE expires<=?", (now,))
-                c.execute("DELETE FROM attempts WHERE bucket=?", (buckets[1],))
-                c.execute("INSERT INTO sessions VALUES (?,?,?,?)",
-                          (hashlib.sha256(token.encode()).hexdigest(), row["id"], csrf, now + 8 * 3600))
-                token_hash = hashlib.sha256(token.encode()).hexdigest()
-                self._seal_identity(c, "session", token_hash, c.execute("SELECT * FROM sessions WHERE hash=?", (token_hash,)).fetchone())
-                self._admin_event(c, row["id"], "login", {"user_id": row["id"]})
-                user = user_public(row)
-        require(not failed, "Invalid credentials", 401)
-        return token, csrf, user
+        return self.authenticate_password(username, password, ip)
 
     def session(self, token):
         require(bool(token), "Authentication required", 401)
@@ -274,6 +249,7 @@ class Store(GovernanceMixin):
             self._check_identity(c, "session", token_hash, session)
             user = self._user(c, session["user_id"])
             require(user["active"], "Account disabled", 401)
+            self._validate_session_security(c, session, user)
             return user_public(user), session["csrf"]
 
     def logout(self, token):

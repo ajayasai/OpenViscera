@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.4.0 — 2026-09-09
+
+- Add local authenticator MFA with expiring password-first challenges, RFC 6238
+  vector tests, one-use factors, persistent throttling and AES-GCM seed storage.
+- Add optional deployment-wide mandatory enrollment, one-use recovery codes,
+  session listing/revocation and fresh-factor requirements for credential changes.
+- Add audited local recovery with explicit lost-factor reset and mandatory
+  personal-password replacement before case access.
+- Preserve historical case schemas and add an explicit database schema-4 upgrade.
+- Invalidate sessions/challenges/setup and old recovery codes on verified restore.
+- Add full browser enrollment/recovery/session/password tests and operating limits.
+
 ## 0.3.0 — 7 September 2026
 
 - Added independently reviewed specimen retention instructions and changes.
